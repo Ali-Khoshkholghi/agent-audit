@@ -13,13 +13,16 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         print(f"error: not a directory: {target}", file=sys.stderr)
         return 1
 
-    summary, result = asyncio.run(harness.run_inspect(target))
+    summary, result = asyncio.run(
+        harness.run_inspect(target, max_budget_usd=args.max_budget_usd)
+    )
     record = telemetry.record_run(target, result)
 
     print(summary)
     print(
         f"\n[session={record['session_id']} turns={record['num_turns']} "
         f"cost=${record['total_cost_usd'] or 0:.4f} "
+        f"subtype={record['subtype']!r} "
         f"terminal_reason={record['terminal_reason']!r}]",
         file=sys.stderr,
     )
@@ -35,6 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
         "inspect", help="Run one agent turn to summarize a target repo's architecture"
     )
     inspect_parser.add_argument("repo_path", help="Path to the target agent repository")
+    inspect_parser.add_argument(
+        "--max-budget-usd",
+        type=float,
+        default=0.50,
+        help="Cost cap; the run terminates with subtype=error_max_budget_usd if exceeded (default: 0.50)",
+    )
     inspect_parser.set_defaults(func=_cmd_inspect)
 
     return parser
