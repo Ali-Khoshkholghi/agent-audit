@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentaudit"
+version = "0.1.0"
+description = "A certification harness for LLM agents, built on the Claude Agent SDK."
+requires-python = ">=3.11"
+dependencies = [
+    "claude-agent-sdk",
+]
+
+[project.scripts]
+agentaudit = "agentaudit.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
