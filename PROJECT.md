@@ -196,6 +196,34 @@ flow falls through to a prompt. Calls auto-approved by `allowed_tools`, an allow
 rule, or the permission mode never reach it. To gate every call, you need the
 `PreToolUse` hook. Get this wrong and your audit trail has holes.
 
+**Resolved trust boundary (decided deliberately, not by default):**
+`sandbox=SandboxSettings(...)` only configures Claude Code's own built-in
+Bash tool sandbox — its docstring says so explicitly ("Filesystem and
+network restrictions are configured via permission rules, not via these
+sandbox settings"). It has no effect on code executed inside our own
+`@tool` handlers, and this harness never gives Claude a `Bash` tool. Real
+sandboxing of target-repo code is built independently, at the OS level, in
+`src/agentaudit/sandbox.py`:
+- macOS: `sandbox-exec` (Seatbelt) — implemented and smoke-tested directly
+  (confirmed: outbound network denied even by raw IP, `/etc` write denied,
+  writes inside the scratch directory succeed).
+- Linux/WSL2: `bubblewrap` — implemented per its documented flag semantics
+  but **untested this session** (no Linux host available). Treat as
+  unverified until it's actually been run.
+- Any other platform, or a missing backend binary, fails closed:
+  `execute_case_against_target` refuses to run target code rather than
+  falling back to unsandboxed execution.
+
+This OS-level sandbox lives inside `execute_case_against_target`'s own
+implementation, so it applies to every caller of that tool regardless of
+which harness code path invokes it (M3's `run_case`, or M5's
+`run_case_executor` subagent dispatch). The three SDK-level permission
+layers above (deny rules / `PreToolUse` audit hook / `can_use_tool`
+judgement), by contrast, are wired onto `run_case` only — that's the path
+`checks/m6.py` exercises. `run_case_executor` keeps auto-approving all
+three MCP tools as it did before M6; only its prompt changed, to pass the
+now-required `target` argument.
+
 ---
 
 ## M7 — Sessions, memory, packaging

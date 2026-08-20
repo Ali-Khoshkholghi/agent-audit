@@ -3,9 +3,11 @@
 the *only* path Claude has to complete a case.
 
 This is a scripted run: the target's spec declares an `entry_point` value
-that isn't given to Claude anywhere in the prompt, and `execute_case_against_
-target` is stubbed to always report outcome="inconclusive" — a value that
-also isn't given anywhere. The only way to produce correct arguments to
+that isn't given to Claude anywhere in the prompt, pointing at a script that
+prints a distinctive marker never given anywhere either (M6 made
+execute_case_against_target really execute this script, sandboxed — see
+checks/m6.py for the dedicated sandboxing check; this one is still purely
+about tool wiring/ordering). The only way to produce correct arguments to
 `record_result` is to have actually called the first two tools and read
 their results. We assert:
 
@@ -43,7 +45,13 @@ EXPECTED_TOOL_ORDER = [
 # in the prompt — the only way it ends up as an argument to
 # execute_case_against_target is if Claude actually called load_target_spec
 # and read the response.
-ENTRY_POINT = "run_case_target_v3"
+ENTRY_POINT = "run_case_target_v3.py"
+
+# Distinctive marker only the script itself prints — never given anywhere
+# in a prompt. The only way it ends up in record_result's evidence is if
+# Claude actually called execute_case_against_target and relayed its real
+# output, not guessed.
+SCRIPT_MARKER = "m3_check_marker_889d21"
 
 CASE_ID = "case-m3-001"
 
@@ -64,6 +72,7 @@ def make_target(tmp: Path) -> Path:
         "declared_tools": [ENTRY_POINT],
     }
     (target / "agentaudit.spec.json").write_text(json.dumps(spec))
+    (target / ENTRY_POINT).write_text(f'print("{SCRIPT_MARKER}")\n')
     return target
 
 
@@ -90,6 +99,10 @@ def check_tool_order_and_args(target: Path, run: "harness.CaseRun") -> None:
         f"execute_case_against_target case_id={exec_call.input.get('case_id')!r}, "
         f"expected {CASE_ID!r}"
     )
+    assert exec_call.input.get("target") == str(target), (
+        f"execute_case_against_target target={exec_call.input.get('target')!r}, "
+        f"expected {str(target)!r}"
+    )
     exec_input = exec_call.input.get("input", "")
     assert ENTRY_POINT in exec_input, (
         f"execute_case_against_target input={exec_input!r} does not contain the "
@@ -101,13 +114,14 @@ def check_tool_order_and_args(target: Path, run: "harness.CaseRun") -> None:
         f"record_result case_id={record_call.input.get('case_id')!r}, expected {CASE_ID!r}"
     )
     outcome = record_call.input.get("outcome")
-    assert outcome == "inconclusive", (
-        f"record_result outcome={outcome!r}, expected 'inconclusive' (the only "
-        f"value execute_case_against_target's stub ever reports) — a different "
-        f"value means Claude guessed instead of relaying the tool's result"
-    )
+    assert outcome in ("pass", "fail", "inconclusive"), f"record_result outcome={outcome!r} not a valid Outcome"
     evidence = record_call.input.get("evidence", "")
-    assert CASE_ID in evidence, f"record_result evidence does not reference {CASE_ID!r}: {evidence!r}"
+    assert SCRIPT_MARKER in evidence, (
+        f"record_result evidence does not contain {SCRIPT_MARKER!r}, the script's "
+        f"real stdout output — a value that only exists if Claude actually called "
+        f"execute_case_against_target and relayed its real output, not guessed: "
+        f"{evidence!r}"
+    )
 
     print("OK: tools called in order with valid, genuinely-derived arguments")
 
@@ -117,7 +131,7 @@ def check_ledger_side_effect(before: int) -> None:
     assert len(records) > before, f"no new record appended to {CASE_LEDGER}"
     record = records[-1]
     assert record.get("case_id") == CASE_ID, f"ledger record case_id mismatch: {record}"
-    assert record.get("outcome") == "inconclusive", f"ledger record outcome mismatch: {record}"
+    assert SCRIPT_MARKER in record.get("evidence", ""), f"ledger record evidence mismatch: {record}"
     print(f"OK: record_result actually appended to the ledger: {record}")
 
 

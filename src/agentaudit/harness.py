@@ -3,16 +3,23 @@ codebase should instantiate ClaudeAgentOptions directly.
 """
 import json
 import re
+import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_agent_sdk import (
     AgentDefinition,
     AssistantMessage,
+    CanUseToolShadowedWarning,
     ClaudeAgentOptions,
+    HookMatcher,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultError,
     ResultMessage,
     TextBlock,
+    ToolPermissionContext,
     ToolResultBlock,
     ToolUseBlock,
     query,
@@ -26,7 +33,7 @@ from agentaudit.schema import (
     RunProvenance,
     TargetMetadata,
 )
-from agentaudit.tools import CASE_LEDGER_PATH, audit_server
+from agentaudit.tools import AUDIT_LEDGER_PATH, CASE_LEDGER_PATH, audit_server
 
 # System prompt decision (M2): custom string, not the claude_code preset.
 # `inspect` isn't a coding tool a human watches and steers in a terminal —
@@ -184,9 +191,10 @@ CASE_PROMPT = (
     "Target repository: {target}\n"
     "Case ID: {case_id}\n\n"
     "Audit this target: load its declared spec, find the entry_point it "
-    "declares, then execute case {case_id} against that target using the "
-    "entry_point's exact string value as the case input. Record the "
-    "result, then confirm in one sentence."
+    "declares, then execute case {case_id} against that target — call "
+    'execute_case_against_target with target="{target}" and input set to '
+    "the entry_point's exact string value. Record the result, then "
+    "confirm in one sentence."
 )
 
 
@@ -202,6 +210,84 @@ class CaseRun:
     result: ResultMessage
 
 
+# --- M6: audit hook + can_use_tool for run_case -----------------------
+#
+# Three layers, matched to the three MCP tools run_case exposes:
+#   - load_target_spec, record_result: safe (read-only spec lookup, an
+#     append-only ledger write) — stay in `allowed_tools`, auto-approved.
+#   - execute_case_against_target: the dangerous one — it now really
+#     executes the target's entry_point (sandboxed, see
+#     tools.execute_case_against_target / agentaudit.sandbox). It's
+#     deliberately left OUT of `allowed_tools` so every call falls through
+#     to `can_use_tool` below, which is the "judgement call that needs
+#     context" PROJECT.md asks for: it checks the call's own `target`
+#     argument actually matches the target this run was invoked against,
+#     before approving.
+#   - The no-matcher PreToolUse hook logs every one of the three calls
+#     unconditionally, regardless of which path approved them — this is
+#     what guarantees the audit ledger has no gaps (auto-approved calls
+#     never reach can_use_tool, but they do reach every registered
+#     PreToolUse hook).
+#
+# Scope: this layering is wired onto run_case only, not onto M5's
+# run_case_executor subagent dispatch (_run_subagent auto-approves all
+# three tools as it always has). The OS-level sandbox inside
+# execute_case_against_target itself is NOT scoped this way — it applies
+# to every caller unconditionally, since it lives inside the tool's own
+# implementation rather than in the SDK permission layer.
+EXECUTE_CASE_TOOL_NAME = "mcp__agentaudit__execute_case_against_target"
+
+
+async def _audit_pretooluse_hook(input_data: dict, tool_use_id: str | None, context) -> dict:
+    """Pure logger: never blocks or modifies. Appends one record per tool
+    call to AUDIT_LEDGER_PATH, regardless of how the call is ultimately
+    approved (allow rule vs can_use_tool) — this is the mechanism, not
+    can_use_tool, that can guarantee the ledger has no gaps, since
+    auto-approved calls skip can_use_tool entirely.
+    """
+    record = {
+        "timestamp": time.time(),
+        "session_id": input_data.get("session_id"),
+        "tool_name": input_data.get("tool_name"),
+        "tool_input": input_data.get("tool_input"),
+        "tool_use_id": tool_use_id,
+    }
+    AUDIT_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_LEDGER_PATH.open("a") as f:
+        f.write(json.dumps(record) + "\n")
+    return {}
+
+
+def _make_case_can_use_tool(target: Path):
+    """Judgement layer for execute_case_against_target: approve only if
+    the call's own `target` argument resolves to the target this run was
+    actually invoked against. Denies anything else that reaches here —
+    fail closed, since only execute_case_against_target should ever reach
+    this callback (the other two tools stay in `allowed_tools`).
+    """
+    resolved_target = target.resolve()
+
+    async def can_use_tool(
+        tool_name: str, tool_input: dict, context: ToolPermissionContext
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if tool_name != EXECUTE_CASE_TOOL_NAME:
+            return PermissionResultDeny(
+                message=f"unexpected tool reached can_use_tool: {tool_name}"
+            )
+
+        requested = tool_input.get("target")
+        if requested is None or Path(requested).resolve() != resolved_target:
+            return PermissionResultDeny(
+                message=(
+                    f"execute_case_against_target's target={requested!r} does not "
+                    f"match this run's audited target {resolved_target}"
+                )
+            )
+        return PermissionResultAllow()
+
+    return can_use_tool
+
+
 async def run_case(
     target: Path, case_id: str, max_budget_usd: float = 0.50
 ) -> CaseRun:
@@ -210,9 +296,16 @@ async def run_case(
     Structurally the only tools Claude can reach: `tools=[]` removes every
     built-in from context (per the custom-tools doc, MCP tools are
     unaffected by this), and `mcp_servers` registers nothing but our own
-    `audit_server`. `allowed_tools` auto-approves the three qualified tool
-    names so the run doesn't stall on a permission prompt for tools that
-    are, by construction, the only ones available anyway.
+    `audit_server`.
+
+    `allowed_tools` auto-approves only load_target_spec and record_result.
+    execute_case_against_target is handled by `can_use_tool` instead (see
+    _make_case_can_use_tool above) — M6's judgement layer. `disallowed_tools`
+    adds declarative hard stops for tools that don't exist in this session's
+    `tools=[]` anyway; redundant with that restriction by design (defense in
+    depth, same reasoning as run_inspect's belt-and-suspenders comment).
+    The no-matcher PreToolUse hook logs every call unconditionally to the
+    audit ledger (M6 layer 2).
 
     `setting_sources=[]` for the same reason as `run_inspect`: `target` is
     an untrusted repo, so its CLAUDE.md/hooks must not load.
@@ -225,9 +318,11 @@ async def run_case(
         mcp_servers={"agentaudit": audit_server},
         allowed_tools=[
             "mcp__agentaudit__load_target_spec",
-            "mcp__agentaudit__execute_case_against_target",
             "mcp__agentaudit__record_result",
         ],
+        disallowed_tools=["Bash", "WebFetch", "Write", "Edit"],
+        hooks={"PreToolUse": [HookMatcher(hooks=[_audit_pretooluse_hook])]},
+        can_use_tool=_make_case_can_use_tool(target),
         max_budget_usd=max_budget_usd,
         # Safety net only (see run_inspect) — three tool calls plus a
         # possible ToolSearch call and a final text turn cluster well
@@ -239,17 +334,23 @@ async def run_case(
     result: ResultMessage | None = None
 
     prompt = CASE_PROMPT.format(target=target, case_id=case_id)
-    try:
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, ToolUseBlock):
-                        tool_calls.append(ToolCall(name=block.name, input=block.input))
-            elif isinstance(message, ResultMessage):
-                result = message
-    except ResultError as e:
-        if result is None:
-            result = _result_from_error(e)
+    # can_use_tool is set, but load_target_spec/record_result are still
+    # pre-approved via allowed_tools by design (see the docstring above) —
+    # that's an intentionally-shadowed pair, not a misconfiguration, so
+    # silence the SDK's one-time warning about it for this call only.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=CanUseToolShadowedWarning)
+        try:
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, ToolUseBlock):
+                            tool_calls.append(ToolCall(name=block.name, input=block.input))
+                elif isinstance(message, ResultMessage):
+                    result = message
+        except ResultError as e:
+            if result is None:
+                result = _result_from_error(e)
 
     if result is None:
         raise RuntimeError("query() stream ended without a ResultMessage")
@@ -533,15 +634,16 @@ CASE_EXECUTOR_AGENT_PROMPT = (
     "You are AgentAudit's case-executor. You test one case against one "
     "target using exactly three tools, in this order, each called exactly "
     "once: (1) load_target_spec, to read the target's declared "
-    "capabilities; (2) execute_case_against_target, to run the case; "
+    "capabilities; (2) execute_case_against_target, passing the target "
+    "repository path as `target` and the case_id and input you were given; "
     "(3) record_result, to record the outcome and evidence that "
     "execute_case_against_target reported. A declared-capabilities spec is "
     "optional metadata a target may not provide — if load_target_spec "
     "reports the spec is missing, that is an expected, non-blocking result: "
-    "proceed to execute_case_against_target anyway using the case_id and "
-    "input you were given. Use execute_case_against_target's actual output "
-    "as input to record_result. After recording, reply with a one-sentence "
-    "confirmation."
+    "proceed to execute_case_against_target anyway using the case_id, "
+    "target, and input you were given. Use execute_case_against_target's "
+    "actual output as input to record_result. After recording, reply with "
+    "a one-sentence confirmation."
 )
 
 EXECUTOR_INVOKE_PROMPT = (

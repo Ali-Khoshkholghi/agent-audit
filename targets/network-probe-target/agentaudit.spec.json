@@ -1,0 +1,5 @@
+{
+  "framework": "raw-script",
+  "entry_point": "probe.py",
+  "declared_tools": ["probe.py"]
+}
