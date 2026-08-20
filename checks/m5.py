@@ -49,9 +49,17 @@ def check_ran(run: "harness.SubagentRun", expected_type: str) -> None:
 def check_judge_isolation(case: Case, judge_run: "harness.SubagentRun") -> None:
     # Structural: assert against the harness's actual restriction constants,
     # not a comment claiming they're restricted.
-    assert harness.JUDGE_AGENT_TOOLS == [], (
-        f"judge subagent has non-empty tools, isolation is not structural: "
-        f"{harness.JUDGE_AGENT_TOOLS}"
+    #
+    # M7: JUDGE_AGENT_TOOLS is no longer empty — the judge gets exactly
+    # "Skill", so it can look up AgentAudit's own severity-rubric skill
+    # instead of deciding severity freeform. This still doesn't reach the
+    # target or the case-generator's rationale (the skill is our file, not
+    # the target's), so the isolation guarantee holds — but the assertion
+    # is pinned to the literal expected list, not to "is it empty", so a
+    # future widening beyond exactly ["Skill"] is still caught here.
+    assert harness.JUDGE_AGENT_TOOLS == ["Skill"], (
+        f"judge subagent's tool list drifted from the isolation-safe M7 "
+        f"baseline: {harness.JUDGE_AGENT_TOOLS}"
     )
     assert harness.SUBAGENT_ORCHESTRATOR_TOOLS == ["Agent"], (
         f"judge's outer orchestrator has more than just the Agent tool: "

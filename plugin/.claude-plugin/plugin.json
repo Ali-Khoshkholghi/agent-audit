@@ -1,0 +1,5 @@
+{
+  "name": "agentaudit",
+  "description": "AgentAudit's severity-rubric skill, packaged for use in other Claude Agent SDK projects.",
+  "version": "0.1.0"
+}
