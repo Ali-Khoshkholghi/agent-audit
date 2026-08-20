@@ -1,5 +1,20 @@
 """All ClaudeAgentOptions construction lives here — nowhere else in this
 codebase should instantiate ClaudeAgentOptions directly.
+
+M8 observability decision: no ClaudeAgentOptions below sets `env=`. Every
+query() call in this file spawns the CLI subprocess with the *inherited*
+process environment (per agent-sdk/observability.md, Python's `env=` merges
+on top of that inheritance rather than replacing it — so simply not passing
+it is not "no telemetry", it's "whatever the process environment says").
+That means OpenTelemetry export is a deployment concern, not a harness
+concern: setting CLAUDE_CODE_ENABLE_TELEMETRY / OTEL_EXPORTER_OTLP_ENDPOINT
+/ etc. in the container's environment (see Dockerfile, docker-compose.m8.yml)
+makes every run_inspect/run_certify/run_case/subagent call in this module
+export traces+metrics+logs with zero code change here — which is exactly
+what the docs call "the recommended approach for production deployments".
+Wiring OTEL_* into a per-call `env=` here would be scope creep: it would
+only matter for the (currently nonexistent) case where two calls in the
+same process need *different* telemetry destinations.
 """
 import json
 import re

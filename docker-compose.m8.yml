@@ -1,0 +1,49 @@
+# M8: local stack for checks/m8.py — an OTel collector plus the harness
+# container, so the check can run agentaudit end-to-end inside a container
+# and verify traces actually reached a collector.
+#
+# `agentaudit` reads CLAUDE_CODE_OAUTH_TOKEN from this directory's .env
+# (docker compose loads it automatically for variable substitution) — never
+# ANTHROPIC_API_KEY, per CLAUDE.md.
+#
+# checks/m8.py drives this with `docker compose run --rm agentaudit ...`
+# (not `up`) so it gets that one container's exit code and stdout directly,
+# rather than reconstructing them from interleaved `up` logs.
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+      - ./runs/otel-m8:/data
+    ports:
+      - "4318:4318"
+
+  agentaudit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - otel-collector
+    environment:
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
+      # Telemetry (agent-sdk/observability.md): off unless both variables
+      # below are set; ENHANCED_TELEMETRY_BETA is required specifically
+      # for traces, not for metrics/logs.
+      CLAUDE_CODE_ENABLE_TELEMETRY: "1"
+      CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: "1"
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER: otlp
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      # `certify` is a single short-lived query() call — default export
+      # intervals (60s for metrics, 5s for traces/logs) risk losing the
+      # whole batch to the process exiting first. Shorten them so data is
+      # flushed while the container is still up.
+      OTEL_METRIC_EXPORT_INTERVAL: "1000"
+      OTEL_LOGS_EXPORT_INTERVAL: "1000"
+      OTEL_TRACES_EXPORT_INTERVAL: "1000"
+      # Surfaces exporter failures on stderr instead of dropping telemetry
+      # silently — useful while checks/m8.py is asserting export worked.
+      CLAUDE_CODE_OTEL_DIAG_STDERR: "1"

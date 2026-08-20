@@ -1,0 +1,93 @@
+# M8: comments a certification verdict on PRs in a target repo.
+#
+# This workflow lives in agentaudit's own repo and, as checked in, certifies
+# one of the bundled `targets/` fixtures on every PR here — that's what lets
+# `docker compose run agentaudit certify <path>` (see docker-compose.m8.yml
+# and checks/m8.py) and this workflow exercise the identical command. To
+# adopt this in an actual target repo being audited, drop this file in
+# unchanged and change `target_path`'s default to `.` (the checked-out
+# repo itself) instead of a fixture path.
+#
+# Auth is CLAUDE_CODE_OAUTH_TOKEN (a subscription long-lived token from
+# `claude setup-token`), never ANTHROPIC_API_KEY — see CLAUDE.md.
+name: Certify
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      target_path:
+        description: "Path (relative to repo root) of the agent repo to certify"
+        required: false
+        default: "targets/simple-langgraph-agent"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install agentaudit
+        run: pip install .
+
+      - name: Run certify
+        id: certify
+        # OTEL_EXPORTER_OTLP_ENDPOINT comes from a repo/org Actions
+        # *variable* (vars, not secrets — collector endpoints aren't
+        # secret), left unset here since this repo has no production
+        # collector configured. Per agent-sdk/observability.md the CLI
+        # fails an export silently if the endpoint is empty/unreachable,
+        # so certify still runs and comments normally either way; set the
+        # repo variable to point this at a real collector.
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_CODE_ENABLE_TELEMETRY: "1"
+          CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: "1"
+          OTEL_TRACES_EXPORTER: otlp
+          OTEL_METRICS_EXPORTER: otlp
+          OTEL_LOGS_EXPORTER: otlp
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
+        # continue-on-error: a NOT_CERTIFIED verdict must still get a PR
+        # comment before the job fails — see the "Fail on NOT_CERTIFIED"
+        # step below, which is what actually gates the check.
+        continue-on-error: true
+        run: |
+          # set +e around the call: GitHub Actions runs bash steps with -e,
+          # which would abort the step (skipping the exit_code capture
+          # below) the instant `agentaudit certify` returns nonzero for a
+          # NOT_CERTIFIED verdict — exactly the case this output exists to
+          # report.
+          set +e
+          TARGET="${{ inputs.target_path || 'targets/simple-langgraph-agent' }}"
+          agentaudit certify "$TARGET" > report.json
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Format PR comment
+        if: github.event_name == 'pull_request'
+        run: python scripts/format_pr_comment.py report.json > comment.md
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
+
+      - name: Fail on NOT_CERTIFIED
+        if: steps.certify.outputs.exit_code != '0'
+        run: |
+          echo "certify exited ${{ steps.certify.outputs.exit_code }} (verdict=not_certified)"
+          exit 1

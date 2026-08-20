@@ -1,0 +1,23 @@
+# M8: a local OTel collector for checks/m8.py to assert traces actually
+# reach a backend. File exporter, not console — console output would get
+# mixed into `docker compose` logs; a file on a bind-mounted volume is
+# something the check script can read back deterministically after the
+# run finishes.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  file:
+    path: /data/traces.json
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file]
+    logs:
+      receivers: [otlp]
+      exporters: [file]

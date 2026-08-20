@@ -5,7 +5,17 @@ import sys
 from pathlib import Path
 
 from agentaudit import harness, telemetry
-from agentaudit.schema import Case
+from agentaudit.schema import Case, Verdict
+
+
+def _verdict_exit_code(verdict: Verdict) -> int:
+    """M8: CI gating policy for `certify`/`audit` — CERTIFIED and
+    CERTIFIED_WITH_FINDINGS both exit 0 (findings are visible in the report/
+    PR comment but don't block a merge on their own); only NOT_CERTIFIED
+    exits 1. This is the one bit a GitHub Actions job needs to fail the
+    check without parsing the report itself.
+    """
+    return 1 if verdict == Verdict.NOT_CERTIFIED else 0
 
 
 def _cmd_inspect(args: argparse.Namespace) -> int:
@@ -58,7 +68,35 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
 
-    return 0
+    return _verdict_exit_code(report.verdict)
+
+
+def _cmd_certify(args: argparse.Namespace) -> int:
+    target = Path(args.repo_path).resolve()
+    if not target.is_dir():
+        print(f"error: not a directory: {target}", file=sys.stderr)
+        return 1
+
+    report = asyncio.run(harness.run_certify(target, max_budget_usd=args.max_budget_usd))
+
+    # JSON on stdout only — this is the machine-readable contract a CI step
+    # (or anything else) parses to build a PR comment; human-facing summary
+    # and provenance go to stderr, same split as inspect/audit.
+    print(report.model_dump_json(indent=2))
+
+    print(f"verdict={report.verdict.value}", file=sys.stderr)
+    for f in report.findings:
+        print(f"  [{f.severity.value}] {f.category.value}: {f.evidence[:100]}", file=sys.stderr)
+
+    provenance = report.provenance
+    print(
+        f"\n[session={provenance.session_id if provenance else ''} "
+        f"turns={provenance.num_turns if provenance else 0} "
+        f"cost=${(provenance.total_cost_usd or 0) if provenance else 0:.4f}]",
+        file=sys.stderr,
+    )
+
+    return _verdict_exit_code(report.verdict)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -99,6 +137,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cost cap per pipeline step (default: 0.50)",
     )
     audit_parser.set_defaults(func=_cmd_audit)
+
+    certify_parser = subparsers.add_parser(
+        "certify",
+        help="Single read-only pass producing a CertificationReport; exit code reflects the verdict",
+    )
+    certify_parser.add_argument("repo_path", help="Path to the target agent repository")
+    certify_parser.add_argument(
+        "--max-budget-usd",
+        type=float,
+        default=0.50,
+        help="Cost cap; the run terminates with subtype=error_max_budget_usd if exceeded (default: 0.50)",
+    )
+    certify_parser.set_defaults(func=_cmd_certify)
 
     return parser
 

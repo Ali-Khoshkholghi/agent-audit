@@ -11,6 +11,13 @@ dependencies = [
     "claude-agent-sdk",
 ]
 
+[project.optional-dependencies]
+# Needed only by checks/m8.py, to parse .github/workflows/certify.yml —
+# not a runtime dependency of agentaudit itself.
+dev = [
+    "pyyaml",
+]
+
 [project.scripts]
 agentaudit = "agentaudit.cli:main"
 
