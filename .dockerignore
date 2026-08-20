@@ -8,4 +8,7 @@ runs/
 .DS_Store
 .idea/
 .vscode/
-plugin/
+# NOT plugin/: .claude/skills/severity-rubric is a symlink into
+# plugin/skills/severity-rubric (see M7) — excluding plugin/ from the
+# build context would leave that symlink dangling in the image and
+# silently break the judge's Skill-tool lookup for containerized `audit`.

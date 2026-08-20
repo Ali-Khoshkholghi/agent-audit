@@ -89,6 +89,14 @@ def check_containerized_run_and_traces() -> None:
     if TRACE_DIR.exists():
         shutil.rmtree(TRACE_DIR)
     TRACE_DIR.mkdir(parents=True)
+    # otel-collector-contrib's image runs as a non-root UID with no shell
+    # (a distroless nonroot base) that never matches the host user who
+    # owns this bind-mounted dir — the default 0o755 has no write bit for
+    # "other", so the file exporter fails with "permission denied" before
+    # the OTLP receivers even start listening. World-writable is fine:
+    # this is disposable local scratch data for the check, torn down by
+    # the `finally` block below regardless of outcome.
+    TRACE_DIR.chmod(0o777)
 
     print("building images...")
     build = _compose("build", capture_output=True, text=True)
@@ -142,6 +150,16 @@ def check_containerized_run_and_traces() -> None:
             "can't confirm the traces are from this run rather than stale data"
         )
         print(f"OK: traces for session={session_id[:8]}... reached the local collector")
+
+        # PROJECT.md's M8 Build text asks for "traces and cost metrics" —
+        # the file exporter is shared across pipelines (see
+        # otel-collector-config.yaml), so cost/token counters land in the
+        # same file as the trace/log data checked above.
+        assert '"name":"claude_code.cost.usage"' in trace_text, (
+            "no claude_code.cost.usage metric found in the export — "
+            "the collector's metrics pipeline may not be wired up"
+        )
+        print("OK: cost metrics reached the local collector")
     finally:
         _compose("down", "-v", capture_output=True, text=True, check=False)
 

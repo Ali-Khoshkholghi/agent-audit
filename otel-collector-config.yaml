@@ -21,3 +21,10 @@ service:
     logs:
       receivers: [otlp]
       exporters: [file]
+    # PROJECT.md's M8 Build text asks for cost metrics, not just traces —
+    # every environment sets OTEL_METRICS_EXPORTER=otlp, but without a
+    # metrics pipeline the collector never registers a /v1/metrics
+    # consumer and the CLI's cost/token counters are silently dropped.
+    metrics:
+      receivers: [otlp]
+      exporters: [file]

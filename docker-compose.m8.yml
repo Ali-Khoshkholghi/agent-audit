@@ -25,6 +25,12 @@ services:
       dockerfile: Dockerfile
     depends_on:
       - otel-collector
+    # Bind-mounts the same path the Dockerfile's editable install lets
+    # RUNS_DIR/REPO_ROOT resolve to (/app/runs) — this is the persistence
+    # the Dockerfile's top comment describes for `agentaudit audit
+    # --run-id`'s resumable state (M7's ledgers, audit state.json).
+    volumes:
+      - ./runs:/app/runs
     environment:
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
       # Telemetry (agent-sdk/observability.md): off unless both variables

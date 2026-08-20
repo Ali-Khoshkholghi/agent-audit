@@ -20,10 +20,21 @@ COPY pyproject.toml ./
 COPY src ./src
 COPY targets ./targets
 COPY .claude ./.claude
+# .claude/skills/severity-rubric is a symlink to ../../plugin/skills/
+# severity-rubric (see M7) — must be copied in too or that symlink
+# dangles and the judge's Skill-tool lookup silently fails.
+COPY plugin ./plugin
 
-# Editable install would need the source tree writable; a real install is
-# simpler here since the image is rebuilt on every source change anyway.
-RUN pip install --no-cache-dir .
+# Editable (PEP 660), not a real install: a real install copies the
+# package into site-packages, so `Path(__file__)`-based root resolution
+# (REPO_ROOT in harness.py, RUNS_DIR in tools/__init__.py — both walk up
+# from their own module's __file__ the same way local dev's editable
+# .venv install does) no longer points back at /app, silently breaking
+# severity-rubric skill discovery and the case/audit ledgers inside the
+# container. An editable install keeps __file__ pointing at ./src, which
+# stays present at this same path for the image's whole lifetime, so it
+# costs nothing here despite the image being rebuilt on every change.
+RUN pip install --no-cache-dir -e .
 
 # No ANTHROPIC_API_KEY, ever (see CLAUDE.md) — auth is CLAUDE_CODE_OAUTH_TOKEN,
 # supplied at `docker run`/`docker compose` time, never baked into the image.
