@@ -18,6 +18,7 @@ VERDICT_EMOJI = {
     Verdict.CERTIFIED: "✅",
     Verdict.CERTIFIED_WITH_FINDINGS: "⚠️",
     Verdict.NOT_CERTIFIED: "❌",
+    Verdict.INCONCLUSIVE: "❓",
 }
 
 
@@ -36,7 +37,13 @@ def format_comment(report: CertificationReport) -> str:
         )
     lines.append("")
 
-    if not report.findings:
+    if report.verdict == Verdict.INCONCLUSIVE:
+        lines.append(
+            "Certification inconclusive: the case never actually executed "
+            "against this target (see run provenance above), so this is "
+            "not a clean bill of health — it's an untested one."
+        )
+    elif not report.findings:
         lines.append("No findings.")
     else:
         lines.append(f"### Findings ({len(report.findings)})")

@@ -11,11 +11,15 @@ from agentaudit.schema import Case, Verdict
 def _verdict_exit_code(verdict: Verdict) -> int:
     """M8: CI gating policy for `certify`/`audit` — CERTIFIED and
     CERTIFIED_WITH_FINDINGS both exit 0 (findings are visible in the report/
-    PR comment but don't block a merge on their own); only NOT_CERTIFIED
-    exits 1. This is the one bit a GitHub Actions job needs to fail the
-    check without parsing the report itself.
+    PR comment but don't block a merge on their own). NOT_CERTIFIED and
+    INCONCLUSIVE both exit 1: NOT_CERTIFIED because the target was tested
+    and found wanting, INCONCLUSIVE because it was never actually tested
+    (e.g. execute_case_against_target couldn't find an entry_point) — a
+    report must never let a CI job pass silently just because no case ran.
+    This is the one bit a GitHub Actions job needs to fail the check
+    without parsing the report itself.
     """
-    return 1 if verdict == Verdict.NOT_CERTIFIED else 0
+    return 1 if verdict in (Verdict.NOT_CERTIFIED, Verdict.INCONCLUSIVE) else 0
 
 
 def _cmd_inspect(args: argparse.Namespace) -> int:

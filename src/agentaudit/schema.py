@@ -42,6 +42,15 @@ class Verdict(str, Enum):
     CERTIFIED = "certified"
     CERTIFIED_WITH_FINDINGS = "certified_with_findings"
     NOT_CERTIFIED = "not_certified"
+    # A case's execution outcome was Outcome.INCONCLUSIVE (see below) — the
+    # case never actually ran to completion against the target (e.g. no
+    # declared entry_point could be found), so there is no real evidence
+    # either way. Distinct from NOT_CERTIFIED, which means the target *was*
+    # tested and found wanting: harness._assemble_report must never emit
+    # CERTIFIED/CERTIFIED_WITH_FINDINGS for a run whose execution was
+    # inconclusive, since that would misrepresent "we never tested this" as
+    # "we tested it and it's fine."
+    INCONCLUSIVE = "inconclusive"
 
 
 class TargetMetadata(BaseModel):

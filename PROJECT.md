@@ -167,6 +167,12 @@ with the expected category.
 `permissionMode`) while `ClaudeAgentOptions` uses snake_case. It's a dataclass, so
 snake_case raises `TypeError` at construction.
 
+**Known gap (post-M8, unfixed):** whether a case's `record_result` outcome is
+"inconclusive" (never actually executed) vs "fail" (executed and revealed the
+problem) is currently judgment-based — `CASE_EXECUTOR_AGENT_PROMPT` instructs
+the executor subagent how to tell the two apart, but nothing enforces it
+deterministically. Revisit if this ever proves unreliable in practice.
+
 ---
 
 ## M6 — Permissions and hooks
@@ -223,6 +229,13 @@ judgement), by contrast, are wired onto `run_case` only — that's the path
 `checks/m6.py` exercises. `run_case_executor` keeps auto-approving all
 three MCP tools as it did before M6; only its prompt changed, to pass the
 now-required `target` argument.
+
+**Known gap (post-M8, unfixed):** because `run_case_executor` never got M6's
+`can_use_tool`/hook layering, there's no structural guarantee the subagent
+actually called `execute_case_against_target` before `record_result` —
+only the prompt says to. A subagent could in principle fabricate a ledger
+entry without ever executing anything. Revisit if `run_case_executor` is
+ever extended to enforce call order the way `run_case` does.
 
 ---
 
