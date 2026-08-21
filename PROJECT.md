@@ -213,9 +213,14 @@ sandboxing of target-repo code is built independently, at the OS level, in
 - macOS: `sandbox-exec` (Seatbelt) — implemented and smoke-tested directly
   (confirmed: outbound network denied even by raw IP, `/etc` write denied,
   writes inside the scratch directory succeed).
-- Linux/WSL2: `bubblewrap` — implemented per its documented flag semantics
-  but **untested this session** (no Linux host available). Treat as
-  unverified until it's actually been run.
+- Linux/WSL2: `bubblewrap` — exercised for real in M10 (on an actual Linux
+  host) and found broken for one real case: `--tmpfs /tmp` shadowed a
+  target `cwd` living under `/tmp`, since a fresh empty tmpfs mounted
+  there hid whatever `--ro-bind / /` had already exposed at that path.
+  Fixed by explicitly re-binding `cwd` after the tmpfs mount, the same way
+  `scratch_dir` already did. Confirmed working post-fix (M10's live check
+  against a target cloned to `/tmp`, and `checks/m3.py`'s own
+  `tempfile.TemporaryDirectory()` fixture, both under `/tmp`).
 - Any other platform, or a missing backend binary, fails closed:
   `execute_case_against_target` refuses to run target code rather than
   falling back to unsandboxed execution.
@@ -323,49 +328,69 @@ react-agent surfaced a sharper version of this — see M10 below.
 
 ---
 
-## M10 — Wire adversarial input into case execution (not started)
+## M10 — Wire target_input into actual execution via stdin
 
-**Status:** logged from live evidence, not implemented. Do not start this
-without deliberately picking it up — it's a real design question, not a bug
-fix.
+**SDK surface:** none — subprocess/stdin plumbing and prompt wording, not new
+SDK surface.
 
-**Evidence (from M9's own live verification run against react-agent, after
-M9's discovery landed and was confirmed working in isolation by
-`checks/m9.py`):** the case-generator proposed a case whose `target_input` was
-a Python expression to execute —
+**Context:** logged from M9's own live verification run against react-agent:
+the case-generator proposed a case whose `target_input` was a Python
+expression to execute —
 `graph.ainvoke({'messages': [('user', 'test query')]}, context=Context(model='gpt-4'))`
 — correct per `Case`'s own schema (`target_input`: "the literal input to feed
 the target when executing this case"). The case-executor then passed that
-string straight through as `execute_case_against_target`'s `input` argument,
-which the tool tried to resolve as a file path and correctly refused
-(`entry_point "graph.ainvoke(...)" not found`), correctly recorded as
-`outcome=inconclusive` — no crash, no fabrication, the M8 fix held. But
-`load_target_spec`'s discovered `src/react_agent/graph.py` was never used at
-all: `EXECUTOR_INVOKE_PROMPT` hands the executor `target_input` framed as "the
-input you were given" for the tool call, which competes with — and here won
-over — `execute_case_against_target`'s own tool description telling it to use
-the spec's `entry_point` instead. Which one a Haiku case-executor actually
-follows appears to be model-judgment-dependent, not deterministic: earlier
-live runs against the same target (the original `SYSTEM_PROMPT_FORMAT_ERROR`
-case, and this session's own `reactagent-verify-*` run) show the executor
-guessing at filenames instead, rather than using `target_input` literally
-as a path either.
+string straight through as `execute_case_against_target`'s single, overloaded
+`input` argument, which the tool tried to resolve as a file path and
+correctly refused (`entry_point "graph.ainvoke(...)" not found`) — no crash,
+no fabrication, the M8 fix held, but `load_target_spec`'s discovered
+`src/react_agent/graph.py` was never used. `EXECUTOR_INVOKE_PROMPT` handed the
+executor `target_input` framed as "the input" for that tool call, competing
+with — and here winning over — the tool's own description telling it to use
+the spec's `entry_point`. Which one a Haiku case-executor actually followed
+was model-judgment-dependent, not deterministic (an earlier live run had it
+guessing filenames instead).
 
-**The open design question:** `execute_case_against_target` currently has no
-real input-passing mechanism at all — it runs `[sys.executable, script_path]`
-with no argv, no stdin, no env var carrying the case's `target_input`. Does it
-need one? If so, what shape — stdin (works generically but requires every
-target's entry point to read stdin), CLI argv (fragile — no agreed argument
-contract across arbitrary target repos), an env var (simple, but same
-"targets have to know to look for it" problem), or something spec-declared
-(`agentaudit.spec.json` grows an `invocation` field a real target could
-opt into, with discovery falling back to "no known way to pass input" —
-consistent with M9's "honest failure over guessing" posture when it can't be
-determined)? Whichever direction this goes, `EXECUTOR_INVOKE_PROMPT` and
-`CASE_EXECUTOR_AGENT_PROMPT` need to stop overloading a single `input` concept
-across two different things (which file to run vs. what to feed it), since
-that conflation is the actual root cause the M9 verification run exposed —
-not a change to `execute_case_against_target`'s plumbing alone.
+**Decision (yours):** stdin, piped by `execute_case_against_target` itself
+into the *discovered* entry_point — never executed directly, never
+imported/called in-process (that would bypass M6's subprocess sandbox). The
+harness picks one consistent method rather than letting the case-generator
+decide per-target.
+
+**Build:** `execute_case_against_target`'s input schema splits the one
+overloaded `input` field into `entry_point` (which file to run — same
+resolution/traversal-guard logic as before) and `stdin_input` (what to feed
+it, piped straight to `sandbox.run_sandboxed`'s new `stdin` parameter, which
+is always passed explicitly — even empty — so a subprocess never silently
+inherits the harness's own real stdin). `EXECUTOR_INVOKE_PROMPT` and
+`CASE_EXECUTOR_AGENT_PROMPT` reworded so `target_input` is explicitly "data to
+pipe to stdin once the real entry_point is found," never something to execute
+directly; `CASE_PROMPT` (M3/M6's `run_case`, which has no `target_input`
+concept) updated only because the tool schema it calls changed underneath it.
+
+**Check — `checks/m10.py`:** three checks. (1) A new purpose-built fixture,
+`targets/stdin-echo-target/` (same precedent as M6's `network-probe-target`),
+whose entry_point reads stdin and echoes it back in a stable marker line —
+deterministically proves stdin reaches a running target's own logic through
+the real OS sandbox, not just that our Python called `subprocess.run(input=
+...)`. (2) Wiring correctness against the real, live react-agent repo: the
+right discovered `entry_point` is used and the right byte count is piped,
+without asserting a specific pass/fail outcome (see Watch for). (3) A live
+`agentaudit audit` sanity run against react-agent, asserting a coherent
+report and, if still `inconclusive`, that it's no longer for the old
+entry_point-not-found reason.
+
+**Watch for:** discovering and correctly piping into an entry_point doesn't
+guarantee a meaningful outcome. `react_agent/graph.py` has no `__main__` or
+any stdin-reading code at all — running it can never observably *consume*
+what's piped to it, no matter how correct the plumbing is. And even a target
+that did read stdin would still need its real dependencies installed
+(`langgraph`/`langchain_openai` aren't in `.venv`, confirmed) and, for an
+LLM-based agent, real network access to call a model — which M6's sandbox
+deliberately denies. A real pass/fail on react-agent's actual planted flaw is
+therefore structurally unreachable in this environment; `inconclusive` staying
+the live outcome after M10 is expected and correct, not a regression — the
+fix is that it's now inconclusive for an honest environment reason instead of
+a wiring bug.
 
 ---
 

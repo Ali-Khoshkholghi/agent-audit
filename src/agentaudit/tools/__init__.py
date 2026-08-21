@@ -205,18 +205,25 @@ async def load_target_spec(args: dict[str, Any]) -> dict[str, Any]:
 @tool(
     "execute_case_against_target",
     "Run one adversarial case against the target and capture its output. "
-    "`input` is the entry_point filename declared in the target's spec "
-    "(from load_target_spec), executed relative to `target`. Execution is "
-    "sandboxed: no network access, and writes are restricted to a scratch "
-    "directory outside the target repo. Call this only after "
-    "load_target_spec, using the entry_point value it reported.",
-    {"case_id": str, "target": str, "input": str},
+    "`entry_point` is the entry_point filename declared or discovered by "
+    "load_target_spec, executed relative to `target` as `python "
+    "<entry_point>` — call this only after load_target_spec, using the "
+    "entry_point value it reported, never a guessed or invented one. "
+    "`stdin_input` is the case's literal input data (Case.target_input) — "
+    "piped to the subprocess's stdin, which is how it actually reaches the "
+    "target; it is never passed as a bare argument, never treated as a "
+    "filename or command, and never imported/called in-process. Pass an "
+    "empty string when a case has no input to feed. Execution is sandboxed: "
+    "no network access, and writes are restricted to a scratch directory "
+    "outside the target repo.",
+    {"case_id": str, "target": str, "entry_point": str, "stdin_input": str},
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
 )
 async def execute_case_against_target(args: dict[str, Any]) -> dict[str, Any]:
     case_id = args["case_id"]
     target_dir = Path(args["target"]).resolve()
-    entry_point = args["input"]
+    entry_point = args["entry_point"]
+    stdin_input = args.get("stdin_input", "") or ""
 
     script_path = (target_dir / entry_point).resolve()
     if not script_path.is_relative_to(target_dir):
@@ -260,6 +267,7 @@ async def execute_case_against_target(args: dict[str, Any]) -> dict[str, Any]:
             cwd=target_dir,
             scratch_dir=scratch_dir,
             timeout=15.0,
+            stdin=stdin_input,
         )
     except sandbox.SandboxUnavailableError as e:
         return {
@@ -276,7 +284,8 @@ async def execute_case_against_target(args: dict[str, Any]) -> dict[str, Any]:
         }
 
     summary = (
-        f"case={case_id} entry_point={entry_point!r} backend={result.backend} "
+        f"case={case_id} entry_point={entry_point!r} "
+        f"stdin_bytes={len(stdin_input.encode())} backend={result.backend} "
         f"returncode={result.returncode} timed_out={result.timed_out}\n"
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
     )

@@ -8,10 +8,10 @@ Python handlers — see execute_case_against_target in tools/__init__.py,
 which is what actually needs sandboxing here. So this module drives the
 same OS primitives directly, ourselves.
 
-Linux support (bubblewrap) is implemented per bubblewrap's documented flag
-semantics but has not been exercised in this session — no Linux host was
-available to test against. Treat it as unverified until it's been run for
-real; the macOS (Seatbelt) backend has been smoke-tested directly.
+Linux support (bubblewrap) has now been exercised for real (M10, on this
+Linux host) and had one real bug fixed as a result — see `_run_bubblewrap`'s
+docstring-comment for the `--tmpfs /tmp` shadowing issue. The macOS
+(Seatbelt) backend has been smoke-tested directly, separately.
 """
 import platform
 import shutil
@@ -39,19 +39,24 @@ class SandboxResult:
 
 
 def run_sandboxed(
-    argv: list[str], *, cwd: Path, scratch_dir: Path, timeout: float = 15.0
+    argv: list[str], *, cwd: Path, scratch_dir: Path, timeout: float = 15.0, stdin: str = ""
 ) -> SandboxResult:
     """Run `argv` with no network access and writes restricted to `scratch_dir`.
 
     `cwd` is readable but not writable — only `scratch_dir` is. Raises
     SandboxUnavailableError if this platform has no supported backend,
     rather than silently running unsandboxed.
+
+    `stdin` (M10) is always passed explicitly to subprocess.run's `input=`,
+    even when empty — never omitted. Omitting it would make subprocess.run
+    inherit this harness's own real stdin, which is both non-deterministic
+    and an unintended leak into a subprocess that's supposed to be sandboxed.
     """
     system = platform.system()
     if system == "Darwin":
-        return _run_seatbelt(argv, cwd=cwd, scratch_dir=scratch_dir, timeout=timeout)
+        return _run_seatbelt(argv, cwd=cwd, scratch_dir=scratch_dir, timeout=timeout, stdin=stdin)
     if system == "Linux":
-        return _run_bubblewrap(argv, cwd=cwd, scratch_dir=scratch_dir, timeout=timeout)
+        return _run_bubblewrap(argv, cwd=cwd, scratch_dir=scratch_dir, timeout=timeout, stdin=stdin)
     raise SandboxUnavailableError(
         f"no sandbox backend for platform {system!r} (supported: Darwin, Linux)"
     )
@@ -77,7 +82,7 @@ _SEATBELT_PROFILE = """\
 
 
 def _run_seatbelt(
-    argv: list[str], *, cwd: Path, scratch_dir: Path, timeout: float
+    argv: list[str], *, cwd: Path, scratch_dir: Path, timeout: float, stdin: str = ""
 ) -> SandboxResult:
     if shutil.which("sandbox-exec") is None:
         raise SandboxUnavailableError("sandbox-exec not found on PATH")
@@ -93,6 +98,7 @@ def _run_seatbelt(
         completed = subprocess.run(
             ["sandbox-exec", "-f", profile_path, *argv],
             cwd=cwd,
+            input=stdin,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -121,13 +127,24 @@ def _run_seatbelt(
 # --bind scratch_dir scratch_dir (read-write, layered on top of the ro
 # bind) is the only writable path; --unshare-net removes the network
 # namespace entirely rather than trying to allowlist/denylist domains.
-# UNTESTED in this session — see module docstring.
+#
+# Exercised for real for the first time in M10 (audited a target cloned to
+# /tmp) and found broken: --tmpfs /tmp mounts a fresh, empty tmpfs over
+# /tmp, which shadows *everything* already ro-bound there by --ro-bind / /
+# — including a target `cwd` that happens to live under /tmp (a cloned
+# repo, or checks/m3.py's own tempfile.TemporaryDirectory() fixture; both
+# hit `bwrap: Can't chdir to <path>: No such file or directory`).
+# scratch_dir already avoided this by explicitly re-binding itself after
+# the tmpfs mount; cwd gets the same explicit re-bind here for the same
+# reason, unconditionally — harmless (redundant with --ro-bind / /) when
+# cwd isn't under /tmp, load-bearing when it is.
 def _run_bubblewrap(
-    argv: list[str], *, cwd: Path, scratch_dir: Path, timeout: float
+    argv: list[str], *, cwd: Path, scratch_dir: Path, timeout: float, stdin: str = ""
 ) -> SandboxResult:
     if shutil.which("bwrap") is None:
         raise SandboxUnavailableError("bwrap (bubblewrap) not found on PATH")
 
+    cwd_resolved = str(cwd.resolve())
     scratch_resolved = str(scratch_dir.resolve())
     bwrap_argv = [
         "bwrap",
@@ -135,10 +152,11 @@ def _run_bubblewrap(
         "--dev", "/dev",
         "--proc", "/proc",
         "--tmpfs", "/tmp",
+        "--ro-bind", cwd_resolved, cwd_resolved,
         "--bind", scratch_resolved, scratch_resolved,
         "--unshare-net",
         "--die-with-parent",
-        "--chdir", str(cwd),
+        "--chdir", cwd_resolved,
         "--",
         *argv,
     ]
@@ -146,6 +164,7 @@ def _run_bubblewrap(
     try:
         completed = subprocess.run(
             bwrap_argv,
+            input=stdin,
             capture_output=True,
             text=True,
             timeout=timeout,

@@ -1,0 +1,5 @@
+{
+  "framework": "raw-script",
+  "entry_point": "echo_stdin.py",
+  "declared_tools": ["echo_stdin.py"]
+}

@@ -103,11 +103,11 @@ def check_tool_order_and_args(target: Path, run: "harness.CaseRun") -> None:
         f"execute_case_against_target target={exec_call.input.get('target')!r}, "
         f"expected {str(target)!r}"
     )
-    exec_input = exec_call.input.get("input", "")
-    assert ENTRY_POINT in exec_input, (
-        f"execute_case_against_target input={exec_input!r} does not contain the "
-        f"entry_point {ENTRY_POINT!r} declared in the spec — Claude didn't use "
-        f"load_target_spec's result"
+    exec_entry_point = exec_call.input.get("entry_point", "")
+    assert ENTRY_POINT in exec_entry_point, (
+        f"execute_case_against_target entry_point={exec_entry_point!r} does not "
+        f"contain the entry_point {ENTRY_POINT!r} declared in the spec — Claude "
+        f"didn't use load_target_spec's result"
     )
 
     assert record_call.input.get("case_id") == CASE_ID, (
