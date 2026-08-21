@@ -213,14 +213,18 @@ sandboxing of target-repo code is built independently, at the OS level, in
 - macOS: `sandbox-exec` (Seatbelt) — implemented and smoke-tested directly
   (confirmed: outbound network denied even by raw IP, `/etc` write denied,
   writes inside the scratch directory succeed).
-- Linux/WSL2: `bubblewrap` — exercised for real in M10 (on an actual Linux
-  host) and found broken for one real case: `--tmpfs /tmp` shadowed a
-  target `cwd` living under `/tmp`, since a fresh empty tmpfs mounted
-  there hid whatever `--ro-bind / /` had already exposed at that path.
-  Fixed by explicitly re-binding `cwd` after the tmpfs mount, the same way
-  `scratch_dir` already did. Confirmed working post-fix (M10's live check
-  against a target cloned to `/tmp`, and `checks/m3.py`'s own
-  `tempfile.TemporaryDirectory()` fixture, both under `/tmp`).
+- Linux/WSL2: `bubblewrap` — **confirmed working**, verified live on a real
+  Debian VM (M10). Exercising it for the first time against a target under
+  `/tmp` found one real bug: `--tmpfs /tmp` shadowed a target `cwd` living
+  under `/tmp`, since a fresh empty tmpfs mounted there hid whatever
+  `--ro-bind / /` had already exposed at that path. Fixed by explicitly
+  re-binding `cwd` after the tmpfs mount, the same way `scratch_dir`
+  already did. Post-fix, `checks/m6.py` passed with ground-truth
+  confirmation, not just the harness's own self-report: the `/etc` write
+  marker file genuinely did not exist on the real filesystem afterward,
+  and the audit ledger's tool-call count matched the message stream's
+  exactly (no unlogged calls). Both network and filesystem-write blocking
+  held under real bubblewrap.
 - Any other platform, or a missing backend binary, fails closed:
   `execute_case_against_target` refuses to run target code rather than
   falling back to unsandboxed execution.

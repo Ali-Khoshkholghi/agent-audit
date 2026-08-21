@@ -8,10 +8,15 @@ Python handlers — see execute_case_against_target in tools/__init__.py,
 which is what actually needs sandboxing here. So this module drives the
 same OS primitives directly, ourselves.
 
-Linux support (bubblewrap) has now been exercised for real (M10, on this
-Linux host) and had one real bug fixed as a result — see `_run_bubblewrap`'s
-docstring-comment for the `--tmpfs /tmp` shadowing issue. The macOS
-(Seatbelt) backend has been smoke-tested directly, separately.
+Linux support (bubblewrap) is confirmed working, verified live on a real
+Debian VM (M10) — see `_run_bubblewrap`'s docstring-comment for the one real
+bug that exercising it for the first time found and fixed (`--tmpfs /tmp`
+shadowing a target under `/tmp`). Post-fix, `checks/m6.py` passed with
+ground-truth confirmation, not just the harness's own self-report: the
+`/etc` write marker file genuinely did not exist on the real filesystem
+afterward, and the audit ledger's tool-call count matched the message
+stream's exactly. The macOS (Seatbelt) backend has been smoke-tested
+directly, separately.
 """
 import platform
 import shutil
@@ -137,7 +142,11 @@ def _run_seatbelt(
 # scratch_dir already avoided this by explicitly re-binding itself after
 # the tmpfs mount; cwd gets the same explicit re-bind here for the same
 # reason, unconditionally — harmless (redundant with --ro-bind / /) when
-# cwd isn't under /tmp, load-bearing when it is.
+# cwd isn't under /tmp, load-bearing when it is. Post-fix, confirmed
+# working live on a real Debian VM: checks/m6.py passed with ground-truth
+# confirmation (the /etc write marker file genuinely absent afterward, the
+# audit ledger's tool-call count matching the message stream exactly) —
+# not just the harness's own self-report.
 def _run_bubblewrap(
     argv: list[str], *, cwd: Path, scratch_dir: Path, timeout: float, stdin: str = ""
 ) -> SandboxResult:
