@@ -278,6 +278,97 @@ verdict.
 
 ---
 
+## M9 — Entry-point discovery without a spec file
+
+**SDK surface:** none — pure Python/heuristics over files already on disk, not
+new SDK surface, so no docs page was fetched for this milestone.
+
+**Context:** confirmed live against `langchain-ai/react-agent` (M8's real-target
+run): most real repos have no `agentaudit.spec.json`, so `load_target_spec`
+always returned `is_error=True` for them and left the case-executor subagent to
+*guess* an entry_point from common filenames on its own — unreliable, and the
+direct cause of that run coming back `verdict=inconclusive` instead of actually
+exercising the target.
+
+**Build:** `load_target_spec` discovers a likely entry_point itself when no spec
+exists, from real signals in priority order: `pyproject.toml`
+(`project.scripts`/`console_scripts`) -> `langgraph.json` (`graphs`) ->
+`package.json` (`main`) -> common filename conventions (`main.py`, `app.py`,
+`agent.py`, `run.py`, `__main__.py`, `src/main.py`, `src/*/graph.py`) as the
+last resort, codifying what the subagent used to improvise. A malformed file at
+any tier falls through to the next rather than aborting discovery. Returns
+`is_error=True` only when nothing resolves, naming exactly what was checked —
+never fabricates a path.
+
+**Check — `checks/m9.py`:** five checks, no mocking of `load_target_spec`
+itself — the `langgraph.json` tier is proven against the real, live react-agent
+clone; the fallback-convention tier against the real, in-repo
+`simple-langgraph-agent` fixture; the `pyproject.toml` tier (plus priority
+order over a present `langgraph.json`) and the `package.json` tier against
+synthetic temp fixtures (no real repo in this project exercises either); and a
+genuine-failure case asserts an honest `is_error` reason rather than a
+fabricated filename.
+
+**Watch for:** discovering a real entry point does not mean it will run.
+`react_agent/graph.py` imports its own package (`from react_agent.context
+import Context`), which only resolves with the package installed or
+`PYTHONPATH`/cwd set up for it — `execute_case_against_target`'s
+`[sys.executable, script_path]` model will likely still hit
+`ModuleNotFoundError`. That's a distinct execution-semantics gap (how a
+discovered entry point actually gets invoked, and how a case's adversarial
+`target_input` reaches it), already handled honestly as
+`outcome=inconclusive`/`fail` per the M8 fix rather than a crash, but not
+something M9 attempts to close. M9's own live end-to-end verification against
+react-agent surfaced a sharper version of this — see M10 below.
+
+---
+
+## M10 — Wire adversarial input into case execution (not started)
+
+**Status:** logged from live evidence, not implemented. Do not start this
+without deliberately picking it up — it's a real design question, not a bug
+fix.
+
+**Evidence (from M9's own live verification run against react-agent, after
+M9's discovery landed and was confirmed working in isolation by
+`checks/m9.py`):** the case-generator proposed a case whose `target_input` was
+a Python expression to execute —
+`graph.ainvoke({'messages': [('user', 'test query')]}, context=Context(model='gpt-4'))`
+— correct per `Case`'s own schema (`target_input`: "the literal input to feed
+the target when executing this case"). The case-executor then passed that
+string straight through as `execute_case_against_target`'s `input` argument,
+which the tool tried to resolve as a file path and correctly refused
+(`entry_point "graph.ainvoke(...)" not found`), correctly recorded as
+`outcome=inconclusive` — no crash, no fabrication, the M8 fix held. But
+`load_target_spec`'s discovered `src/react_agent/graph.py` was never used at
+all: `EXECUTOR_INVOKE_PROMPT` hands the executor `target_input` framed as "the
+input you were given" for the tool call, which competes with — and here won
+over — `execute_case_against_target`'s own tool description telling it to use
+the spec's `entry_point` instead. Which one a Haiku case-executor actually
+follows appears to be model-judgment-dependent, not deterministic: earlier
+live runs against the same target (the original `SYSTEM_PROMPT_FORMAT_ERROR`
+case, and this session's own `reactagent-verify-*` run) show the executor
+guessing at filenames instead, rather than using `target_input` literally
+as a path either.
+
+**The open design question:** `execute_case_against_target` currently has no
+real input-passing mechanism at all — it runs `[sys.executable, script_path]`
+with no argv, no stdin, no env var carrying the case's `target_input`. Does it
+need one? If so, what shape — stdin (works generically but requires every
+target's entry point to read stdin), CLI argv (fragile — no agreed argument
+contract across arbitrary target repos), an env var (simple, but same
+"targets have to know to look for it" problem), or something spec-declared
+(`agentaudit.spec.json` grows an `invocation` field a real target could
+opt into, with discovery falling back to "no known way to pass input" —
+consistent with M9's "honest failure over guessing" posture when it can't be
+determined)? Whichever direction this goes, `EXECUTOR_INVOKE_PROMPT` and
+`CASE_EXECUTOR_AGENT_PROMPT` need to stop overloading a single `input` concept
+across two different things (which file to run vs. what to feed it), since
+that conflation is the actual root cause the M9 verification run exposed —
+not a change to `execute_case_against_target`'s plumbing alone.
+
+---
+
 ## Open design questions
 
 Decide these deliberately rather than by default. Worth thinking through before

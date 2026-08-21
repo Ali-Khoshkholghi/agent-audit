@@ -10,6 +10,7 @@ so it applies no matter which harness code path calls it.
 import json
 import sys
 import time
+import tomllib
 import uuid
 from pathlib import Path
 from typing import Any
@@ -29,38 +30,176 @@ AUDIT_LEDGER_PATH = RUNS_DIR / "audit.jsonl"
 SCRATCH_ROOT = RUNS_DIR / "scratch"
 
 
+# M9: most real target repos (confirmed live against langchain-ai/react-agent)
+# have no agentaudit.spec.json. Before M9, that left the case-executor
+# subagent to *guess* an entry_point from common filenames on its own —
+# unreliable and untestable. These four tiers replace that guessing with
+# deterministic discovery from real signals already in the repo, checked in
+# priority order; each returns (relative_path, human-readable source) on a
+# match or (None, None) to fall through to the next tier.
+def _resolve_candidate(target: Path, relative: str) -> Path | None:
+    """A discovered path counts only if it's a real file that actually
+    stays inside `target` — same path-traversal posture
+    execute_case_against_target's own check applies, since a malicious
+    pyproject.toml/langgraph.json/package.json is untrusted input too.
+    """
+    candidate = (target / relative).resolve()
+    if not candidate.is_relative_to(target.resolve()):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _discover_from_pyproject(target: Path) -> tuple[str | None, str | None]:
+    pyproject = target / "pyproject.toml"
+    if not pyproject.is_file():
+        return None, None
+    try:
+        data = tomllib.loads(pyproject.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return None, None
+
+    project = data.get("project", {}) or {}
+    scripts: dict[str, Any] = dict(project.get("scripts", {}) or {})
+    console_scripts = (project.get("entry-points", {}) or {}).get("console_scripts", {})
+    scripts.update(console_scripts or {})
+
+    for name, entry in scripts.items():
+        if not isinstance(entry, str):
+            continue
+        module = entry.split(":", 1)[0]
+        rel = module.replace(".", "/") + ".py"
+        for prefix in ("", "src/"):
+            candidate = prefix + rel
+            if _resolve_candidate(target, candidate) is not None:
+                return candidate, f"pyproject.toml:project.scripts.{name}"
+    return None, None
+
+
+def _discover_from_langgraph_json(target: Path) -> tuple[str | None, str | None]:
+    spec_file = target / "langgraph.json"
+    if not spec_file.is_file():
+        return None, None
+    try:
+        data = json.loads(spec_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, None
+
+    for name, value in (data.get("graphs", {}) or {}).items():
+        if not isinstance(value, str):
+            continue
+        # langgraph.json's own convention is "path/to/file.py:attr" (the
+        # graph object inside that module) — keep only the path component,
+        # matching execute_case_against_target's existing bare-script
+        # contract; the :attr half is a separate execution-semantics
+        # question, out of scope here.
+        path_part = value.split(":", 1)[0]
+        if path_part.startswith("./"):
+            path_part = path_part[2:]
+        if _resolve_candidate(target, path_part) is not None:
+            return path_part, f"langgraph.json:graphs.{name}"
+    return None, None
+
+
+def _discover_from_package_json(target: Path) -> tuple[str | None, str | None]:
+    package_file = target / "package.json"
+    if not package_file.is_file():
+        return None, None
+    try:
+        data = json.loads(package_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, None
+
+    main = data.get("main")
+    if isinstance(main, str) and _resolve_candidate(target, main) is not None:
+        return main, "package.json:main"
+    return None, None
+
+
+# The filenames the case-executor subagent was, until M9, left to guess on
+# its own against a spec-less target (see CASE_EXECUTOR_AGENT_PROMPT in
+# harness.py and the live react-agent evidence that motivated this).
+# Codified here as the deterministic last resort, tried only after the
+# three real-signal tiers above find nothing.
+_FALLBACK_FILENAMES = ("main.py", "app.py", "agent.py", "run.py", "__main__.py", "src/main.py")
+
+
+def _discover_from_conventions(target: Path) -> tuple[str | None, str | None]:
+    for name in _FALLBACK_FILENAMES:
+        if _resolve_candidate(target, name) is not None:
+            return name, f"convention:{name}"
+    for graph_py in sorted(target.glob("src/*/graph.py")):
+        rel = graph_py.relative_to(target).as_posix()
+        if _resolve_candidate(target, rel) is not None:
+            return rel, "convention:src/*/graph.py"
+    return None, None
+
+
+_DISCOVERY_TIERS = (
+    ("pyproject.toml", _discover_from_pyproject),
+    ("langgraph.json", _discover_from_langgraph_json),
+    ("package.json", _discover_from_package_json),
+    ("common conventions", _discover_from_conventions),
+)
+
+
+def _discover_entry_point(target: Path) -> tuple[str | None, str]:
+    checked: list[str] = []
+    for label, finder in _DISCOVERY_TIERS:
+        entry_point, source = finder(target)
+        if entry_point is not None:
+            assert source is not None
+            return entry_point, source
+        checked.append(label)
+    return None, (
+        "checked " + ", ".join(checked) + f" (fallback filenames tried: "
+        f"{', '.join(_FALLBACK_FILENAMES)}, src/*/graph.py) — none found"
+    )
+
+
 @tool(
     "load_target_spec",
     "Read a target repository's declared capabilities. Looks for "
-    "agentaudit.spec.json at the root of the given target directory and "
-    "returns its contents.",
+    "agentaudit.spec.json at the root of the given target directory; most "
+    "real repos don't have one, so if it's missing this discovers a likely "
+    "entry_point instead from real signals — pyproject.toml's "
+    "project.scripts/console_scripts, langgraph.json's graphs field, "
+    "package.json's main field, then common filename conventions, in that "
+    "order — rather than leaving the caller to guess. Returns is_error only "
+    "if neither a declared spec nor discovery finds anything to run.",
     {"path": str},
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 async def load_target_spec(args: dict[str, Any]) -> dict[str, Any]:
     target = Path(args["path"])
     spec_file = target / "agentaudit.spec.json"
-    if not spec_file.is_file():
+    if spec_file.is_file():
+        try:
+            spec_text = spec_file.read_text()
+            json.loads(spec_text)  # validate it parses before handing it to Claude
+        except (OSError, json.JSONDecodeError) as e:
+            return {
+                "content": [{"type": "text", "text": f"Could not read spec: {e}"}],
+                "is_error": True,
+            }
+        return {"content": [{"type": "text", "text": spec_text}]}
+
+    entry_point, reason = _discover_entry_point(target)
+    if entry_point is None:
         return {
             "content": [
                 {
                     "type": "text",
-                    "text": f"No agentaudit.spec.json found at {spec_file}",
+                    "text": (
+                        f"No agentaudit.spec.json found at {spec_file}. "
+                        f"Entry-point discovery found nothing to run either: {reason}."
+                    ),
                 }
             ],
             "is_error": True,
         }
 
-    try:
-        spec_text = spec_file.read_text()
-        json.loads(spec_text)  # validate it parses before handing it to Claude
-    except (OSError, json.JSONDecodeError) as e:
-        return {
-            "content": [{"type": "text", "text": f"Could not read spec: {e}"}],
-            "is_error": True,
-        }
-
-    return {"content": [{"type": "text", "text": spec_text}]}
+    discovered_spec = json.dumps({"entry_point": entry_point, "source": reason})
+    return {"content": [{"type": "text", "text": discovered_spec}]}
 
 
 @tool(
