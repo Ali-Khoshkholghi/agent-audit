@@ -12,8 +12,11 @@ ends in a check script that either passes or fails — no "it looked fine."
 
 ## Project status
 
-**This is an active, ongoing project, not a finished v1.0.** The original
-8-milestone plan (M1–M8) is done, but running it against a real target
+**This is an active, ongoing project.**
+
+If you're interested in collaborating on this project in any capacity, please reach out via my [LinkedIn](https://www.linkedin.com/in/ali-khoshkholghi-phd-33584614b/).
+
+The original 8-milestone plan (M1–M8) is done, but running it against a real target
 (`langchain-ai/react-agent`) kept surfacing gaps the plan hadn't
 anticipated — entry-point discovery with no spec file, actually piping input
 into a target's stdin, installing a target's own dependencies before it can
