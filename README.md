@@ -38,6 +38,21 @@ The pipeline runs as three isolated agents:
 - **judge** — sees only results, never the target source or the generator's
   reasoning, and rules on each case (Opus)
 
+## How this differs from existing tools
+
+Most tools in this space — Confident AI, General Analysis, PyRIT, garak,
+DeepTeam, and similar — test a deployed model or API endpoint by sending
+adversarial prompts and evaluating the responses. AgentAudit does something
+different: it points at an agent's actual source repository, reads the code
+to discover how it's invoked, installs its real dependencies, and executes
+it in an OS-level sandbox. It's testing the real implementation, not the
+model's responses to it.
+
+That's a narrower scope, not a broader one. AgentAudit doesn't do
+multi-turn conversation attacks, doesn't test prompt injection via tool
+output, and doesn't map findings to an OWASP/NIST taxonomy — the
+commercial tools cover that ground; this one doesn't attempt to.
+
 ## Setup
 
 Requires Python 3.11+. On Debian/Ubuntu, `pip install claude-agent-sdk`
