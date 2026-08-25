@@ -3,18 +3,14 @@
 A certification harness for LLM agents, built end-to-end on the [Claude Agent
 SDK](https://docs.claude.com/en/api/agent-sdk/overview) (Python).
 
-It exists to learn the Agent SDK properly — not by reading the docs, but by
-building something with real stakes on every surface the SDK exposes: the
-query loop, permissions, custom tools, structured output, isolated subagents,
-sandboxed execution, session durability, and a containerized deployment. Each
-milestone in [`PROJECT.md`](PROJECT.md) exercises one part of the SDK and
+Each milestone in [`PROJECT.md`](PROJECT.md) exercises one part of the SDK and
 ends in a check script that either passes or fails — no "it looked fine."
 
 ## Project status
 
 **This is an active, ongoing project.**
 
-If you're interested in collaborating on this project in any capacity, please reach out via my [LinkedIn](https://www.linkedin.com/in/ali-khoshkholghi-phd-33584614b/).
+**If you're interested in collaborating on this project in any capacity, please reach out via my [LinkedIn](https://www.linkedin.com/in/ali-khoshkholghi-phd-33584614b/).**
 
 The original 8-milestone plan (M1–M8) is done, but running it against a real target
 (`langchain-ai/react-agent`) kept surfacing gaps the plan hadn't
