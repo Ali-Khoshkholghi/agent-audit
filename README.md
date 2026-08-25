@@ -46,7 +46,11 @@ adversarial prompts and evaluating the responses. AgentAudit does something
 different: it points at an agent's actual source repository, reads the code
 to discover how it's invoked, installs its real dependencies, and executes
 it in an OS-level sandbox. It's testing the real implementation, not the
-model's responses to it.
+model's responses to it. This matters because a lot of real agent bugs
+live in the implementation, not the model's responses — dependency and
+environment failures, silent error handling, unsafe file or network
+access — the kind of issues prompt-based testing won't surface no matter
+how adversarial the prompts are.
 
 That's a narrower scope, not a broader one. AgentAudit doesn't do
 multi-turn conversation attacks, doesn't test prompt injection via tool
