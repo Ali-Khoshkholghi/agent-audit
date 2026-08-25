@@ -8,6 +8,7 @@ scratch directory. That sandboxing lives inside this tool's implementation,
 so it applies no matter which harness code path calls it.
 """
 import json
+import shutil
 import sys
 import time
 import tomllib
@@ -26,6 +27,15 @@ CASE_LEDGER_PATH = RUNS_DIR / "cases.jsonl"
 # (see harness._audit_pretooluse_hook) — a complete, unconditional record
 # of every tool call, independent of whether it was approved or denied.
 AUDIT_LEDGER_PATH = RUNS_DIR / "audit.jsonl"
+
+# M11b: raw execute_case_against_target results (returncode/timed_out/
+# stdout/stderr), written by this module itself — never LLM-paraphrased.
+# harness._is_structurally_silent reads this back to catch a case-executor
+# labeling a silent, no-op execution "fail"/"pass" instead of
+# "inconclusive" (see run_case_executor's docstring). Deliberately a
+# separate file from CASE_LEDGER_PATH: that one records what the subagent
+# *concluded*; this one records what actually, mechanically happened.
+EXECUTION_LEDGER_PATH = RUNS_DIR / "executions.jsonl"
 
 SCRATCH_ROOT = RUNS_DIR / "scratch"
 
@@ -213,9 +223,12 @@ async def load_target_spec(args: dict[str, Any]) -> dict[str, Any]:
     "piped to the subprocess's stdin, which is how it actually reaches the "
     "target; it is never passed as a bare argument, never treated as a "
     "filename or command, and never imported/called in-process. Pass an "
-    "empty string when a case has no input to feed. Execution is sandboxed: "
-    "no network access, and writes are restricted to a scratch directory "
-    "outside the target repo.",
+    "empty string when a case has no input to feed. If the target has its "
+    "own pyproject.toml, its declared dependencies (and the target's own "
+    "package) are installed into a fresh disposable venv before execution "
+    "(M11); a target with no pyproject.toml runs as before, unaffected. "
+    "Execution itself is always sandboxed: no network access, and writes "
+    "are restricted to a scratch directory outside the target repo.",
     {"case_id": str, "target": str, "entry_point": str, "stdin_input": str},
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
 )
@@ -261,9 +274,33 @@ async def execute_case_against_target(args: dict[str, Any]) -> dict[str, Any]:
     scratch_dir = SCRATCH_ROOT / uuid.uuid4().hex
     scratch_dir.mkdir(parents=True, exist_ok=True)
 
+    # M11: install the target's own declared dependencies (pyproject.toml
+    # only, v1) into a fresh disposable venv before running its
+    # entry_point. A target with no pyproject.toml at all has nothing to
+    # install — that's a skip, not a failure, and execution proceeds with
+    # the harness's own interpreter exactly as it did before M11. Any other
+    # non-ok result (malformed manifest, install failed, install timed out)
+    # is a real reason execution can't proceed honestly, reported the same
+    # is_error way load_target_spec already reports discovery failures.
+    python_executable = sys.executable
+    install = sandbox.install_target_dependencies(target_dir, scratch_dir, timeout=180.0)
+    if install.ok:
+        assert install.python_path is not None
+        python_executable = str(install.python_path)
+    elif not install.skip:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Could not install target dependencies: {install.reason}",
+                }
+            ],
+            "is_error": True,
+        }
+
     try:
         result = sandbox.run_sandboxed(
-            [sys.executable, str(script_path)],
+            [python_executable, str(script_path)],
             cwd=target_dir,
             scratch_dir=scratch_dir,
             timeout=15.0,
@@ -282,6 +319,29 @@ async def execute_case_against_target(args: dict[str, Any]) -> dict[str, Any]:
             ],
             "is_error": True,
         }
+    finally:
+        # Ephemeral, no persistence across runs (M11) — remove the venv
+        # regardless of how execution went. (install_target_dependencies
+        # already cleaned up its own internal source-copy scratch space
+        # before returning.)
+        shutil.rmtree(scratch_dir / "venv", ignore_errors=True)
+
+    # M11b: ground-truth record for run_case_executor's deterministic
+    # fail-vs-inconclusive override — the raw SandboxResult fields, written
+    # here rather than derived from `summary`/the subagent's later prose,
+    # since evidence text is an LLM paraphrase and unsafe to pattern-match.
+    execution_record = {
+        "timestamp": time.time(),
+        "case_id": case_id,
+        "entry_point": entry_point,
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+    EXECUTION_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with EXECUTION_LEDGER_PATH.open("a") as f:
+        f.write(json.dumps(execution_record) + "\n")
 
     summary = (
         f"case={case_id} entry_point={entry_point!r} "

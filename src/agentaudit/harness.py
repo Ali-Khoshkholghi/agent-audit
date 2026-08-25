@@ -52,7 +52,13 @@ from agentaudit.schema import (
     TargetMetadata,
     Verdict,
 )
-from agentaudit.tools import AUDIT_LEDGER_PATH, CASE_LEDGER_PATH, RUNS_DIR, audit_server
+from agentaudit.tools import (
+    AUDIT_LEDGER_PATH,
+    CASE_LEDGER_PATH,
+    EXECUTION_LEDGER_PATH,
+    RUNS_DIR,
+    audit_server,
+)
 
 # M7: repo root, computed rather than trusting the process's actual cwd, so
 # that skill discovery for run_judge (see below) doesn't depend on "checks
@@ -582,6 +588,42 @@ def _read_last_case_record(case_id: str) -> dict | None:
     return matching[-1] if matching else None
 
 
+def _read_last_execution_record(case_id: str) -> dict | None:
+    """Mirrors _read_last_case_record above, but reads EXECUTION_LEDGER_PATH
+    — the raw, never-LLM-touched execute_case_against_target result (M11b),
+    not what the case-executor subagent concluded from it.
+    """
+    if not EXECUTION_LEDGER_PATH.exists():
+        return None
+    records = [
+        json.loads(line)
+        for line in EXECUTION_LEDGER_PATH.read_text().splitlines()
+        if line.strip()
+    ]
+    matching = [r for r in records if r.get("case_id") == case_id]
+    return matching[-1] if matching else None
+
+
+# M11b: the fail-vs-inconclusive gap PROJECT.md's M5 section flags as a
+# known, unenforced judgment call — confirmed live via
+# model_name_format_validation_missing against react-agent, where the
+# case-executor labeled a case "fail" even though execution reported
+# returncode=0 with empty stdout/stderr (react-agent's graph.py has no
+# __main__/stdin-reading code, per M10 — nothing was ever actually
+# exercised). A non-zero returncode with no output is deliberately NOT
+# silent: a crash with nothing printed is still real evidence something
+# happened. Only a clean exit with literally nothing observed counts.
+def _is_structurally_silent(exec_record: dict | None) -> bool:
+    if exec_record is None:
+        return False
+    return (
+        exec_record.get("returncode") == 0
+        and not exec_record.get("timed_out")
+        and not (exec_record.get("stdout") or "").strip()
+        and not (exec_record.get("stderr") or "").strip()
+    )
+
+
 @dataclass
 class SubagentRun:
     subagent_type: str
@@ -934,9 +976,28 @@ async def run_case_executor(
         raise RuntimeError(
             f"case-executor did not append a ledger record for case_id={case.case_id!r}"
         )
-    execution = CaseExecution(
-        case_id=record["case_id"], outcome=record["outcome"], evidence=record["evidence"]
-    )
+
+    outcome = record["outcome"]
+    evidence = record["evidence"]
+
+    # M11b: deterministic override, not a second opinion the subagent could
+    # out-argue — see _is_structurally_silent's docstring. cases.jsonl
+    # (`record`, above) is left exactly as the subagent wrote it; only the
+    # CaseExecution returned here — what actually flows into run_judge and
+    # the final report — is corrected.
+    if outcome in ("fail", "pass") and _is_structurally_silent(
+        _read_last_execution_record(case.case_id)
+    ):
+        evidence = (
+            "Overridden by the harness: execution completed cleanly "
+            "(returncode=0, no timeout) but produced no stdout and no "
+            f"stderr — the tested code path was never actually exercised, "
+            f"regardless of the case-executor's own outcome={outcome!r} "
+            f"conclusion. Original evidence: {evidence}"
+        )
+        outcome = "inconclusive"
+
+    execution = CaseExecution(case_id=record["case_id"], outcome=outcome, evidence=evidence)
     return execution, run
 
 

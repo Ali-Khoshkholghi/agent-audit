@@ -1,0 +1,5 @@
+{
+  "framework": "raw-script",
+  "entry_point": "main.py",
+  "declared_tools": ["main.py"]
+}

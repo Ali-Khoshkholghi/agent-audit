@@ -167,11 +167,51 @@ with the expected category.
 `permissionMode`) while `ClaudeAgentOptions` uses snake_case. It's a dataclass, so
 snake_case raises `TypeError` at construction.
 
-**Known gap (post-M8, unfixed):** whether a case's `record_result` outcome is
-"inconclusive" (never actually executed) vs "fail" (executed and revealed the
-problem) is currently judgment-based — `CASE_EXECUTOR_AGENT_PROMPT` instructs
-the executor subagent how to tell the two apart, but nothing enforces it
-deterministically. Revisit if this ever proves unreliable in practice.
+**Known gap (post-M8, closed by M11b):** whether a case's `record_result`
+outcome is "inconclusive" (never actually executed) vs "fail" (executed and
+revealed the problem) was judgment-based — `CASE_EXECUTOR_AGENT_PROMPT`
+instructed the executor subagent how to tell the two apart, but nothing
+enforced it deterministically. Proved unreliable in practice exactly as this
+note warned: the `model_name_format_validation_missing` case against
+react-agent was labeled "fail" even though `execute_case_against_target`
+reported `returncode=0` with empty stdout/stderr — react-agent's `graph.py`
+has no `__main__`/stdin-reading code (M10), so nothing was ever actually
+exercised. Fixed in `run_case_executor`: `execute_case_against_target` now
+also writes a second, purely mechanical ledger
+(`EXECUTION_LEDGER_PATH`/`executions.jsonl` in `tools/__init__.py`) of the
+raw `SandboxResult` fields, never LLM-paraphrased. `harness._is_structurally_silent`
+reads it back and deterministically forces outcome to `"inconclusive"`
+whenever it's `"fail"` **or `"pass"`** but the matching execution record
+shows a clean exit (`returncode==0`, no timeout) with literally no stdout
+and no stderr — both labels, not just "fail", since a "pass" grounded in
+zero observable evidence is equally unfounded. A non-zero returncode with
+no output is deliberately *not* treated as silent — a crash with nothing
+printed is still real evidence something happened. `cases.jsonl` is never
+rewritten (forward-looking only); only the in-memory `CaseExecution`
+returned to `run_judge`/`_assemble_report` is corrected. `run_case` (M3/M6's
+separate direct-invocation path) needed no change — it never constructs a
+`CaseExecution` or feeds a `CertificationReport`. See `checks/m11b.py`,
+verified live: re-running `checks/m10.py`'s and `checks/m11.py`'s own live
+`agentaudit audit` checks against the real react-agent clone now shows
+`execution_evidence` beginning with `"Overridden by the harness: ..."`
+where it previously would have silently accepted the subagent's `"fail"`/`"pass"`
+label.
+
+**Residual gap (caught in a follow-up review, accepted rather than fixed —
+low likelihood, real complexity to close):** `_read_last_execution_record`
+takes the *last* `executions.jsonl` line matching a `case_id`, same "last
+line wins" pattern `_read_last_case_record` already used for `cases.jsonl`.
+That's only correct if `execute_case_against_target` is called exactly once
+per case — enforced today only by `CASE_EXECUTOR_AGENT_PROMPT` saying so in
+prose, not deterministically. A case-executor that retried the tool call
+(e.g. after a transient error) could leave the execution record the
+override checks against pointing at a different attempt than the one
+`record_result`'s outcome was actually based on. No evidence this has
+happened in practice — every `case_id` observed in `executions.jsonl` so
+far has exactly one record — and closing it properly would mean threading a
+call identifier (e.g. `tool_use_id`) through both tools and matching on
+that instead of `case_id` alone, which is more machinery than this fix's
+actual, confirmed bug warranted. Revisit if retries are ever observed.
 
 ---
 
@@ -395,6 +435,174 @@ therefore structurally unreachable in this environment; `inconclusive` staying
 the live outcome after M10 is expected and correct, not a regression — the
 fix is that it's now inconclusive for an honest environment reason instead of
 a wiring bug.
+
+---
+
+## M11 — Per-target ephemeral dependency installation
+
+**SDK surface:** none — subprocess/venv plumbing, not new Agent SDK surface, same
+as M9/M10.
+
+**Context:** M9/M10 fixed entry-point discovery and stdin wiring against the real
+`langchain-ai/react-agent` clone, but both left the same gap open, documented in
+M10's "Watch for": `react_agent/graph.py` can't even be imported —
+`langgraph`/`langchain_openai` aren't installed anywhere the harness can see, and
+`graph.py` itself does `from react_agent.context import Context`, which only
+resolves once `react_agent`'s own package is installed too.
+
+**Scope adjustment (decided against the real target, not assumed):** confirmed
+live that react-agent ships `pyproject.toml` with PEP 621
+`[project.dependencies]` and a setuptools `[build-system]` — no
+`requirements.txt` anywhere in the repo. v1 supports `pyproject.toml` only.
+
+**Build:** `agentaudit.sandbox.install_target_dependencies(target, scratch_dir,
+timeout=)` — before running a case's entry_point,
+`execute_case_against_target` calls this to build a fresh, disposable venv
+under the case's `scratch_dir` and installs the target itself into it (`pip
+install <copy-of-target>`, not just its parsed dependency strings — this
+resolves `[project.dependencies]` *and* builds/installs the target's own
+package via its declared `[build-system]` backend in one step, which is what
+actually fixes the `react_agent.context` import, not just the third-party
+packages). No new MCP tool, no prompt changes — baked into the existing tool's
+implementation, same as M6's sandboxing and M9's discovery, deliberately to
+avoid reintroducing M10's exact failure class (an LLM-facing step whose framing
+competed with a tool's own contract).
+
+A target with no `pyproject.toml` at all is unaffected — that's a skip signal,
+not a failure, and execution proceeds with the harness's own interpreter
+exactly as before M11. Every other non-ok result (malformed manifest, install
+failed, install timed out) reports `is_error=True` with the concrete reason,
+flowing into `CaseExecution.outcome=Outcome.INCONCLUSIVE` through the same
+channel M9/M10 already established.
+
+`run_sandboxed` gained two parameters to support this: `allow_network` (Linux:
+conditionally omits `--unshare-net`; macOS: swaps in a second Seatbelt profile
+with the network deny removed, filesystem rules unchanged) and `env` (passed
+straight to `subprocess.run`; `None`, the default and every pre-M11 caller's
+behavior, means unchanged full-parent-env passthrough). Target *execution*
+itself stays `allow_network=False` throughout — M11 only opens network for the
+install step, never for the target's own code, which is still fully
+network-denied per M6.
+
+**Network scoping (deliberate, not an oversight):** this environment has
+neither `iptables`/`nft` nor passwordless root (confirmed by testing:
+`sudo -n` fails, no firewall tooling on PATH), so there is no OS-level
+per-host firewall available to build inside the sandbox's network namespace —
+bubblewrap's own network control is all-or-nothing. What scoping there is
+comes from pip itself: `--index-url` pinned to `pypi.org` with matching
+`--trusted-host` entries, nothing else configured. This is a soft, pip-level
+boundary, not an OS-enforced one — a malicious sdist's build script could in
+principle still reach other hosts during its own build step. Same
+honest-tradeoff posture as M6's `SandboxSettings` note above: written down
+deliberately rather than implied to be stronger than it is.
+
+**The compounding risk this alone doesn't tell you (caught in a follow-up
+review, fixed the same session, not left as "just document it"):** target
+execution and venv creation also get read access to the *whole* host
+filesystem (`--ro-bind / /` / blanket `(allow file-read*)`) — fine for them,
+since neither has network, so even a compromised entry_point can't
+exfiltrate what it reads. `pip install` of an untrusted package is
+different: it genuinely executes attacker-controlled code (`setup.py`/PEP
+517 build hooks), and with both broad read *and* open network true at the
+same time, that combination — not "might fetch from an unexpected host" —
+is the real exposure: it could read anything the harness process can (SSH
+keys, cloud credentials, this repo's own source) and send it anywhere.
+Fixed: the `pip install` call (only that one — venv creation stays
+network-denied, so its broad read is unchanged and fine) now also passes
+`read_paths` to `run_sandboxed`, replacing read-everywhere with a curated
+allowlist — this process's own Python installation
+(`sys.base_prefix`/`base_exec_prefix`, resolved at runtime rather than
+hardcoded, since it may not live under `/usr`: this environment's is a
+conda env under `$HOME`), the base OS directories needed to exec anything
+at all (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64` — shipped software, not
+secrets), and a handful of specific `/etc` files needed for DNS/TLS (not
+all of `/etc`, which also holds real secrets like SSH host keys). Verified
+directly, not just by inspection: `checks/m11.py`'s 7th check plants a fake
+secret file outside the allowlist and asserts the sandboxed `pip install`
+posture genuinely can't read it (`cat` fails with "No such file or
+directory"). This narrows what a malicious build script could steal even
+though network stays open; it does not, and cannot within this
+environment's constraints (no iptables/root), close the network side
+itself — that half remains the soft, pip-level boundary described above.
+
+**A real bwrap bug found building the narrowed read scope, worth recording
+because the failure mode was misleading:** binding each `read_paths` entry
+at its `.resolve()`d path broke pip install with `bwrap: execvp
+.../venv/bin/python: No such file or directory` — a nested-namespace
+mount-table corruption, not a missing-file problem. On a usrmerge system
+(this Debian box), `/bin`, `/sbin`, `/lib`, `/lib64` are symlinks into
+`/usr`; resolving them before binding collapsed their *destination* paths
+onto `/usr/bin` etc. too, nesting those binds under the already-bound
+`/usr` mountpoint. That nested-under-nested pattern corrupted bwrap's mount
+table badly enough to silently break a *different*, unrelated later bind
+(the scratch_dir bind that's supposed to expose `venv/bin/python`) — with
+an error message that pointed at the venv, not at the real cause. Confirmed
+by manually bisecting the exact bind list down to the specific redundant
+entries. Fixed by binding at the literal requested path instead of the
+resolved one: the kernel follows the symlink on the *source* side normally,
+and `/bin`/`/usr` end up as siblings in the new namespace rather than one
+nested inside the other.
+
+**Real bugs found exercising this against react-agent and reviewing the diff
+(not anticipated by the plan):**
+- `pip install <target_dir>` directly against the real target failed with
+  `error: could not create 'react_agent.egg-info': Read-only file system` —
+  setuptools writes its `<pkg>.egg-info/` build metadata directly into the
+  source directory it's given, which is standard pip behavior for a
+  local-path install, not something this harness opted into. `target` is
+  read-only in the sandbox (the harness must never mutate the thing under
+  audit), so the fix installs from a throwaway copy of `target` under
+  `scratch_dir/install_src` instead — the real target directory is never
+  written to.
+- That copy wasn't being cleaned up on any path (only `venv_dir` was).
+  `install_target_dependencies` now wraps the create-venv-and-install
+  sequence in `try/finally` and always removes `install_src` before
+  returning, success or failure alike — it's a purely internal
+  implementation detail, never needed by the caller, unlike `venv_dir`,
+  which the caller needs on success and is responsible for removing itself
+  once the case finishes executing.
+- Skip-vs-failure was originally discriminated by substring-matching the
+  human-readable `reason` text (`"no pyproject.toml found" not in
+  install.reason`) in `execute_case_against_target` — the same field that
+  also carries raw pip/venv `stderr` tails for real failures. A subagent
+  review flagged the latent coupling: a future error message that happened
+  to contain that phrase would silently misclassify a genuine install
+  failure as "nothing to install," letting execution proceed with
+  `sys.executable` against an unbuilt target while masking that
+  dependencies were never installed. Fixed with a dedicated `skip: bool`
+  field on `DependencyInstallResult` — a structural signal, not prose.
+- The same review caught that `timeout` was passed separately to venv
+  creation and to `pip install`, so a slow install could take up to ~2x the
+  stated budget before the time-box actually fired — worth calling a real
+  gap against "time-box the install," not just a style nit. Fixed: a single
+  `deadline = time.monotonic() + timeout` is computed once, and the second
+  subprocess call gets whatever's left of it (`deadline - time.monotonic()`),
+  returning a timed-out result immediately, without even attempting pip
+  install, if venv creation alone consumed the whole budget.
+
+**Check — `checks/m11.py`:** seven checks, no mocking of `install_target_dependencies`
+itself. (1) A target with no `pyproject.toml` (`targets/stdin-echo-target`) is
+unaffected — regression check. (2) A new fixture,
+`targets/pyproject-broken-target/` (a `pyproject.toml` declaring one real,
+nonexistent PyPI package — fast and deterministic, a 404 from the index, no
+timeout trickery needed), fails honestly with the concrete reason, and never
+actually runs its `main.py`. (3) `install_target_dependencies` called directly
+against the real react-agent clone with an artificially tiny timeout (`0.01s`)
+proves the time-box cuts off a real in-flight install, not just a theoretical
+one. (4) A real install against react-agent, at the real default timeout,
+makes both `langgraph` and `react_agent` itself importable through the
+installed venv's own python — closing the M9 gap directly. (5) Wiring: running
+react-agent's discovered entry_point through `execute_case_against_target`
+no longer shows `ModuleNotFoundError` anywhere in its output. (6) A live
+end-to-end `agentaudit audit` sanity run against react-agent — this now
+reaches a genuine outcome (`verdict="certified"` observed live, not
+`inconclusive`), a real step past M9/M10's structurally-blocked state; the
+check still tolerates `inconclusive` but asserts it carries none of the old
+M9/M10/M11 wiring-failure signatures if so. (7) The `pip install` step's
+narrowed `read_paths` actually excludes a path outside its allowlist — plants
+a fake secret file, asserts the sandboxed posture used for that call genuinely
+can't read it, proving the read-scope hardening blocks a real read rather than
+just coexisting with a working pip install.
 
 ---
 

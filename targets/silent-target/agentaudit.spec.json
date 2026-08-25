@@ -1,0 +1,5 @@
+{
+  "framework": "raw-script",
+  "entry_point": "silent.py",
+  "declared_tools": ["silent.py"]
+}
