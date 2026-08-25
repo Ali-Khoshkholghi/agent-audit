@@ -18,7 +18,7 @@ execute_case_against_target so a target with no pyproject.toml is completely
 unaffected (skip, not a failure) and a target with one gets its own venv's
 python instead of sys.executable.
 
-Seven checks, mirroring M10's structure (fast fixture proofs first, then live
+Eight checks, mirroring M10's structure (fast fixture proofs first, then live
 proof against the real react-agent clone):
 
 1. No-manifest targets are unaffected by M11 (regression check).
@@ -36,11 +36,21 @@ proof against the real react-agent clone):
 7. The pip install step's narrowed read scope actually excludes a path
    outside its allowlist — proves the read-scope hardening blocks real
    reads, not just that pip still happens to work under it.
+8. macOS-only (skips elsewhere, doesn't silently pass): a real install
+   against react-agent succeeds end-to-end specifically under the Seatbelt
+   backend. Regression guard for a real bug found post-M11 — the narrowed
+   read Seatbelt profile, translated straight from bubblewrap's allowlist,
+   crashed on macOS (dyld aborts with SIGABRT before Python even starts;
+   see `_SEATBELT_PROFILE_NETWORK_NARROW_READ`'s comment in sandbox.py for
+   the full diagnosis). Check 4 above exercises whatever platform CI
+   happens to run on; this one exists so the Seatbelt path specifically
+   can't go unexercised again the way it did the first time.
 
 Run with: python checks/m11.py
 """
 import asyncio
 import json
+import platform
 import shutil
 import subprocess
 import sys
@@ -230,35 +240,103 @@ def check_install_read_scope_excludes_outside_paths() -> None:
     access via `read_paths` specifically to cap that. This proves the
     narrowing actually blocks a real read, not just that pip still happens
     to work under it — a path outside the allowlist must not be visible.
+
+    Two probe locations, not one — a subagent review of the macOS Seatbelt
+    fix (see `_SEATBELT_PROFILE_NETWORK_NARROW_READ`'s comment in
+    sandbox.py) caught that a single `/tmp` probe would be a false-confidence
+    check there: that profile denies `/private/tmp` unconditionally,
+    independent of whatever `read_paths` actually contains, so a `/tmp`-only
+    probe would keep passing even if `_install_read_paths()`/`read_paths`
+    curation were completely broken or empty. The home-directory probe below
+    isn't covered by any platform-specific hardcoded deny — on macOS it's
+    only blocked because it falls outside `read_paths`' re-opened overrides
+    within the denied home directory; on Linux (bubblewrap) it's blocked
+    because `read_paths` was never a broad allowlist to begin with. Either
+    way, it actually exercises the mechanism this check's docstring claims
+    to prove.
     """
-    secret_dir = Path("/tmp/agentaudit-m11-secret-probe")
-    shutil.rmtree(secret_dir, ignore_errors=True)
-    secret_dir.mkdir(parents=True)
-    secret_file = secret_dir / "id_rsa"
-    secret_file.write_text("FAKE-SECRET-SHOULD-NOT-BE-READABLE-DURING-INSTALL")
+    home_secret_dir = Path.home() / "agentaudit-m11-secret-probe"
+    tmp_secret_dir = Path("/tmp/agentaudit-m11-secret-probe")
+    probes = []
+    for secret_dir, label in ((home_secret_dir, "home"), (tmp_secret_dir, "/tmp")):
+        shutil.rmtree(secret_dir, ignore_errors=True)
+        secret_dir.mkdir(parents=True)
+        secret_file = secret_dir / "id_rsa"
+        secret_file.write_text("FAKE-SECRET-SHOULD-NOT-BE-READABLE-DURING-INSTALL")
+        probes.append((secret_file, label))
 
     scratch_dir = _fresh_scratch_dir()
     try:
+        for secret_file, label in probes:
+            probe = sandbox.run_sandboxed(
+                ["cat", str(secret_file)],
+                cwd=scratch_dir,
+                scratch_dir=scratch_dir,
+                timeout=10.0,
+                allow_network=True,
+                read_paths=sandbox._install_read_paths(),
+            )
+            assert probe.returncode != 0, (
+                f"a path outside the install step's read allowlist ({label}) was "
+                f"readable: {probe.stdout!r}"
+            )
+            assert "FAKE-SECRET" not in probe.stdout, (
+                f"the {label} secret leaked into stdout despite a non-zero returncode: "
+                f"{probe.stdout!r}"
+            )
+            print(
+                f"OK: the install step's narrowed read scope excludes the {label} probe "
+                f"(cat failed: {probe.stderr.strip()!r})"
+            )
+    finally:
+        shutil.rmtree(home_secret_dir, ignore_errors=True)
+        shutil.rmtree(tmp_secret_dir, ignore_errors=True)
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def check_seatbelt_install_succeeds_end_to_end() -> None:
+    """Regression guard, macOS-only: a real pip install against react-agent
+    must succeed end-to-end specifically under the Seatbelt backend, not
+    just "on whatever platform happened to run check 4". Skips (printing why,
+    not silently passing) on non-Darwin, so a Linux-only CI run can't give
+    false confidence about macOS coverage the way it did before this bug was
+    found — see `_SEATBELT_PROFILE_NETWORK_NARROW_READ`'s comment in
+    sandbox.py for the crash this reproduces if it regresses.
+    """
+    if platform.system() != "Darwin":
+        print("SKIP: check_seatbelt_install_succeeds_end_to_end only applies on macOS (Seatbelt)")
+        return
+
+    target = _ensure_react_agent_clone()
+    scratch_dir = _fresh_scratch_dir()
+    try:
+        result = sandbox.install_target_dependencies(target, scratch_dir, timeout=300.0)
+        assert result.ok, (
+            f"real pip install against react-agent failed under Seatbelt: {result.reason}"
+        )
+        assert result.python_path is not None and result.python_path.is_file()
+
         probe = sandbox.run_sandboxed(
-            ["cat", str(secret_file)],
-            cwd=scratch_dir,
+            [
+                str(result.python_path),
+                "-c",
+                "import langgraph; from react_agent.context import Context; print('IMPORT_OK')",
+            ],
+            cwd=target,
             scratch_dir=scratch_dir,
-            timeout=10.0,
-            allow_network=True,
-            read_paths=sandbox._install_read_paths(),
+            timeout=30.0,
         )
-        assert probe.returncode != 0, (
-            f"a path outside the install step's read allowlist was readable: {probe.stdout!r}"
-        )
-        assert "FAKE-SECRET" not in probe.stdout, (
-            f"the secret leaked into stdout despite a non-zero returncode: {probe.stdout!r}"
+        assert probe.backend == "seatbelt", f"expected the seatbelt backend, got {probe.backend!r}"
+        assert "IMPORT_OK" in probe.stdout, (
+            f"install reported success but the installed venv can't actually import "
+            f"langgraph/react-agent (returncode={probe.returncode}): {probe.stderr!r}"
         )
         print(
-            "OK: the install step's narrowed read scope genuinely excludes a path "
-            f"outside its allowlist (cat failed: {probe.stderr.strip()!r})"
+            "OK: a real pip install against react-agent succeeds end-to-end under Seatbelt "
+            "(dyld boots under the narrowed read profile, DNS resolves, langgraph and "
+            "react-agent's own package both import)"
         )
     finally:
-        shutil.rmtree(secret_dir, ignore_errors=True)
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
@@ -270,6 +348,7 @@ def main() -> int:
     asyncio.run(check_module_not_found_error_gone())
     check_live_audit_sanity()
     check_install_read_scope_excludes_outside_paths()
+    check_seatbelt_install_succeeds_end_to_end()
     return 0
 
 

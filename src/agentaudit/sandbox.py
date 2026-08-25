@@ -15,8 +15,33 @@ shadowing a target under `/tmp`). Post-fix, `checks/m6.py` passed with
 ground-truth confirmation, not just the harness's own self-report: the
 `/etc` write marker file genuinely did not exist on the real filesystem
 afterward, and the audit ledger's tool-call count matched the message
-stream's exactly. The macOS (Seatbelt) backend has been smoke-tested
-directly, separately.
+stream's exactly. The macOS (Seatbelt) backend for target execution (M6)
+and venv creation (M11), both of which use the blanket `(allow
+file-read*)` profiles, has been smoke-tested directly.
+
+The macOS `pip install` path (M11's `read_paths`-narrowed profile,
+`_SEATBELT_PROFILE_NETWORK_NARROW_READ`) was *not* exercised on macOS
+before, and broke: reproducing `install_target_dependencies` directly
+against the real react-agent clone found the narrow-read allowlist,
+translated straight from bubblewrap's args, was missing several
+macOS-only requirements (root-directory read access dyld needs to boot at
+all, `SystemVersion.plist` for pip's own wheel-tag resolution, and more
+generally proved unable to enumerate everything `getaddrinfo`'s
+mDNSResponder path touches for DNS). See
+`_SEATBELT_PROFILE_NETWORK_NARROW_READ`'s comment for the full diagnosis
+and why its fix takes a different shape (allow-broadly-then-deny-home)
+than the Linux allowlist. Verified post-fix with a real end-to-end `pip
+install` against react-agent succeeding under Seatbelt — see
+`checks/m11.py`'s macOS-only check.
+
+**Known security trade-off, not just a fix:** that macOS fix makes the
+pip-install sandbox fail OPEN (readable unless denylisted) where
+`_run_bubblewrap`'s `read_paths` handling fails CLOSED (readable only if
+allowlisted) — a genuinely weaker isolation model on macOS, adopted
+because macOS DNS resolution for that step couldn't be reliably reduced to
+a finite set of allowlisted paths. See
+`_SEATBELT_PROFILE_NETWORK_NARROW_READ`'s "SECURITY TRADE-OFF" comment for
+the full reasoning.
 """
 import os
 import platform
@@ -156,21 +181,119 @@ _SEATBELT_PROFILE_NETWORK = """\
 (allow network*)
 """
 
-# M11: used only when `read_paths` narrows the readable filesystem (the
-# `pip install` sub-step specifically — see run_sandboxed's docstring for
-# why). Replaces the blanket `(allow file-read*)` above with subpath rules
-# for cwd, scratch_dir, and each entry in read_paths; network stays
-# unconditionally allowed, since this profile is only ever used for that
-# one network-enabled call.
+# SECURITY TRADE-OFF, stated plainly: this profile fails OPEN, unlike every
+# other sandbox posture in this file. `_run_bubblewrap`'s `read_paths`
+# handling (below) fails CLOSED — nothing is readable unless it's on the
+# allowlist, full stop, so a path this code never anticipated is safe by
+# default. This Seatbelt profile is the opposite: everything is readable
+# unless it's on the denylist, so a path this code never anticipated is
+# exposed by default. That's a strictly weaker security model, adopted
+# deliberately, not accidentally: macOS DNS resolution for the pip-install
+# step (`getaddrinfo` via `mDNSResponder`/`configd`) could not be reliably
+# reduced to a finite, enumerable set of allowlisted paths — see point 3
+# below and the bisection notes there — so a fails-closed allowlist was not
+# achievable here with the confidence bubblewrap's allowlist has on Linux.
+# If macOS ever exposes a supported way to scope Seatbelt reads to exactly
+# what `getaddrinfo` needs, switch this back to fails-closed to match
+# bubblewrap; until then, treat this asymmetry as a known, accepted gap in
+# the macOS backend's isolation strength, not a solved problem.
+#
+# M11 (macOS diagnosis, post-M11): used only when `read_paths` narrows the
+# readable filesystem (the `pip install` sub-step specifically — see
+# run_sandboxed's docstring for why). The v1 shape of this profile mirrored
+# bubblewrap's approach directly: `(deny default)` plus an allowlist of
+# exactly `read_paths` and nothing else. That shape is unworkable on macOS —
+# reproduced directly (isolated `install_target_dependencies` against a real
+# react-agent clone under Seatbelt, bypassing the full audit pipeline) and
+# root-caused via the macOS crash reporter
+# (~/Library/Logs/DiagnosticReports/*.ips), not guessed:
+#
+# 1. An allowlist of specific `subpath` rules never grants access to the
+#    root directory `/` itself — `subpath "X"` covers `X` and everything
+#    under it, not `/`, unless `/` is separately allowed. dyld4's
+#    `CacheFinder` (which locates the shared cache every dynamically-linked
+#    process needs to even start) reads `/` directly during process launch,
+#    before any Python bytecode runs. Without it, dyld aborts
+#    (`SIGABRT`/`returncode=-6`) with empty stdout/stderr — exactly the
+#    opaque failure this was diagnosing. Confirmed by bisecting profiles
+#    with `sandbox-exec` directly: `(allow file-read* (subpath "/"))` boots
+#    fine; the same allowlist plus every other top-level directory *except*
+#    a `/` grant still crashes identically.
+# 2. Past that, pip's own wheel-tag resolution
+#    (`packaging.tags.mac_platforms`) calls `platform.mac_ver()`, which
+#    reads `/System/Library/CoreServices/SystemVersion.plist` — not on the
+#    bwrap-derived allowlist at all.
+# 3. Past that, DNS resolution for PyPI failed
+#    (`nodename nor servname provided`) even with every specific system
+#    directory enumerated (`/System`, `/Library`, `/private`, `/usr`,
+#    `/bin`, `/sbin`, `/opt`, `/Applications`, ...) and `mach-lookup`
+#    explicitly allowed — macOS doesn't do glibc-style `resolv.conf` reads;
+#    `getaddrinfo` goes through `mDNSResponder`/`configd`, and exactly which
+#    file(s) that path needs read access to was not pinned down by
+#    per-directory enumeration even after extensive bisection.
+#
+# Given (1) and (3) both trace back to "the allowlist is missing some
+# macOS-internal path", and per-path enumeration demonstrably can't be made
+# complete with reasonable confidence, this profile is built the opposite
+# way from bubblewrap's: allow read broadly, then explicitly deny the
+# things the threat model in run_sandboxed's docstring actually cares about
+# — SSH keys, cloud credentials, the harness's own source (all of which
+# live under the invoking user's home directory) — plus a few adjacent
+# human-data locations a subagent review flagged as reachable under a bare
+# "deny just $HOME" version of this: every *other* local account's home
+# directory (`/Users`, not just this one's), root's home (`/private/var/root`),
+# and externally mounted volumes (`/Volumes`) — none of them load-bearing
+# for a `pip install`, all of them plausible places for a real credential to
+# sit. Plus `/etc/ssh`'s host keys (parity with the Linux allowlist's
+# explicit exclusion of the same) and `/tmp` (a shared, world-writable
+# location any other process or CI step could have dropped a secret into).
+# Then `read_paths`/cwd/scratch_dir are re-opened as overrides in case any
+# of them happen to live under a denied path (as `sys.base_prefix` does
+# here, under a pyenv install under home). Seatbelt resolves overlapping
+# rules by specificity, most-specific-subpath-wins, confirmed by direct
+# testing: reading a real dotfile under home is denied, while the
+# venv/scratch carve-outs and DNS both work, and a full `pip install`
+# against the real react-agent clone (`langgraph`, `langchain-openai`, and
+# react-agent's own package) succeeds end-to-end under this profile.
+# `mach-lookup` is allowed unconditionally too (needed in principle for the
+# mDNSResponder/configd IPC `getaddrinfo` uses; kept even though the direct
+# blocker in (3) turned out to be a file-read gap, not a missing
+# mach-lookup grant — no reason to leave a maybe-load-bearing permission
+# out once the trade-off is this narrow read scope, not the network
+# boundary).
+#
+# What this does NOT close, and can't in a general way: a credential whose
+# location is set by an environment variable pointing somewhere other than
+# a denied directory — `KUBECONFIG`, `GOOGLE_APPLICATION_CREDENTIALS`, a CI
+# secrets mount under `/opt/...` or `/private/var/...` outside
+# `/private/var/root`, etc. That's an unbounded set on either platform;
+# bubblewrap's allowlist doesn't handle it either (it's just narrow enough,
+# by construction, to never reach such a path in the first place). This
+# profile's read surface for everything *outside* the denied directories is
+# therefore genuinely broader than bubblewrap's read_paths allowlist for
+# the same call — that's a real, deliberate trade-off (per-path
+# enumeration proved operationally unreliable on macOS — see above), not a
+# claim that the two postures are equivalent. Scoped to Seatbelt only, not
+# a change to bubblewrap's own approach, which has no equivalent
+# "missing root grant" failure mode (a fresh `--tmpfs /` mount is
+# inherently readable/listable on its own).
 _SEATBELT_PROFILE_NETWORK_NARROW_READ = """\
 (version 1)
 (deny default)
+(allow file-read* (subpath "/"))
+(deny file-read* (subpath "{home}"))
+(deny file-read* (subpath "/Users"))
+(deny file-read* (subpath "/private/var/root"))
+(deny file-read* (subpath "/Volumes"))
+(deny file-read* (subpath "/private/etc/ssh"))
+(deny file-read* (subpath "/private/tmp"))
 {read_rules}
 (allow file-write* (subpath "{scratch_dir}"))
 (allow process-fork)
 (allow process-exec)
 (allow signal (target self))
 (allow sysctl-read)
+(allow mach-lookup)
 (allow network*)
 """
 
@@ -194,7 +317,9 @@ def _run_seatbelt(
         rules.append(f'(allow file-read* (subpath "{cwd.resolve()}"))')
         rules.append(f'(allow file-read* (subpath "{scratch_dir.resolve()}"))')
         profile = _SEATBELT_PROFILE_NETWORK_NARROW_READ.format(
-            read_rules="\n".join(rules), scratch_dir=str(scratch_dir.resolve())
+            home=str(Path.home().resolve()),
+            read_rules="\n".join(rules),
+            scratch_dir=str(scratch_dir.resolve()),
         )
     else:
         template = _SEATBELT_PROFILE_NETWORK if allow_network else _SEATBELT_PROFILE
